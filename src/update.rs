@@ -38,28 +38,11 @@ pub fn run(check_only: bool) -> Result<()> {
         "Echo updates currently support Windows x64 MSVC only"
     );
 
-    let client = ureq::Agent::new_with_config(
-        ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(120)))
-            .https_only(true)
-            .build(),
-    );
+    let client = client(Duration::from_secs(120));
     println!("Checking GitHub Releases for Amity Echo...");
-    let mut response = client.get(LATEST_RELEASE_URL)
-        .header("Accept", "application/vnd.github+json")
-        .header("User-Agent", "Amity-Echo-Updater")
-        .call()
-        .context("requesting the latest public Echo release from GitHub")?;
-    let metadata = response.body_mut().with_config().limit(1024 * 1024)
-        .read_to_vec().context("reading Echo release metadata")?;
-    let release: Release = serde_json::from_slice(&metadata)
-        .context("GitHub returned invalid release metadata")?;
-    ensure!(!release.draft && !release.prerelease, "latest Echo release is not a stable published release");
-    let remote_version = release.tag_name.strip_prefix('v')
-        .context("Echo release tag must begin with v")
-        .and_then(|version| Version::parse(version).context("Echo release tag has an invalid version"))?;
-    let current_version = Version::parse(env!("CARGO_PKG_VERSION"))
-        .context("installed Echo version is invalid")?;
+    let release = fetch_release(&client)?;
+    let remote_version = release_version(&release)?;
+    let current_version = installed_version()?;
     let executable_asset = release.assets.iter().find(|asset| asset.name == EXECUTABLE_ASSET)
         .with_context(|| format!("release {} has no Windows executable asset", release.tag_name))?;
     let checksum_asset = release.assets.iter().find(|asset| asset.name == CHECKSUM_ASSET)
@@ -97,6 +80,51 @@ pub fn run(check_only: bool) -> Result<()> {
         .context("replacing the Echo executable; ensure its install directory is writable")?;
     println!("Updated Echo from {current_version} to {remote_version}. Start echocli again to use it.");
     Ok(())
+}
+
+/// A short, read-only check for the interactive header. It never downloads an asset.
+pub fn available_version() -> Result<Option<Version>> {
+    if !cfg!(all(target_os = "windows", target_arch = "x86_64", target_env = "msvc")) {
+        return Ok(None);
+    }
+    let release = fetch_release(&client(Duration::from_secs(5)))?;
+    let remote_version = release_version(&release)?;
+    if remote_version <= installed_version()? { return Ok(None); }
+    ensure!(release.assets.iter().any(|asset| asset.name == EXECUTABLE_ASSET)
+        && release.assets.iter().any(|asset| asset.name == CHECKSUM_ASSET),
+        "latest Echo release has no Windows update assets");
+    Ok(Some(remote_version))
+}
+
+fn client(timeout: Duration) -> ureq::Agent {
+    ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .timeout_global(Some(timeout))
+            .https_only(true)
+            .build(),
+    )
+}
+
+fn fetch_release(client: &ureq::Agent) -> Result<Release> {
+    let mut response = client.get(LATEST_RELEASE_URL)
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "Amity-Echo-Updater")
+        .call()
+        .context("requesting the latest public Echo release from GitHub")?;
+    let metadata = response.body_mut().with_config().limit(1024 * 1024)
+        .read_to_vec().context("reading Echo release metadata")?;
+    serde_json::from_slice(&metadata).context("GitHub returned invalid release metadata")
+}
+
+fn release_version(release: &Release) -> Result<Version> {
+    ensure!(!release.draft && !release.prerelease, "latest Echo release is not a stable published release");
+    release.tag_name.strip_prefix('v')
+        .context("Echo release tag must begin with v")
+        .and_then(|version| Version::parse(version).context("Echo release tag has an invalid version"))
+}
+
+fn installed_version() -> Result<Version> {
+    Version::parse(env!("CARGO_PKG_VERSION")).context("installed Echo version is invalid")
 }
 
 fn download_asset(client: &ureq::Agent, tag: &str, name: &str, path: &Path,

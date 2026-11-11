@@ -6,6 +6,8 @@ use std::cell::RefCell;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use crossterm::{execute, queue};
@@ -37,6 +39,7 @@ pub struct Terminal {
     history_path: PathBuf,
     color: bool,
     screen: Option<RefCell<Screen>>,
+    update_check: Option<Receiver<Result<Option<semver::Version>>>>,
 }
 
 #[derive(Clone, Copy)]
@@ -72,6 +75,7 @@ struct Screen {
     menu_index: usize,
     menu_dismissed: bool,
     session_menu_loaded: bool,
+    update_version: Option<String>,
 }
 
 impl Terminal {
@@ -88,6 +92,7 @@ impl Terminal {
                 && env::var_os("NO_COLOR").is_none()
                 && env::var("TERM").ok().as_deref() != Some("dumb"),
             screen: None,
+            update_check: None,
         })
     }
 
@@ -106,7 +111,13 @@ impl Terminal {
             history: Vec::new(), history_position: None, saved_draft: String::new(),
             engaged: false, menu_choices: Vec::new(), project_connected: false,
             menu_index: 0, menu_dismissed: false, session_menu_loaded: false,
+            update_version: None,
         }));
+        let (sender, receiver) = mpsc::channel();
+        self.update_check = Some(receiver);
+        std::thread::spawn(move || {
+            let _ = sender.send(crate::update::available_version());
+        });
         self.draw().context("drawing Echo terminal screen")
     }
 
@@ -319,8 +330,14 @@ impl Terminal {
 
     fn screen_input_loop(&mut self, record_input: bool,
         mut session_choices: Option<&mut dyn FnMut() -> Result<Vec<MenuChoice>>>) -> Result<Input> {
+        self.refresh_update_notice();
         self.draw()?;
         loop {
+            if self.update_check.is_some()
+                && !event::poll(Duration::from_millis(250)).context("waiting for Echo keyboard input")? {
+                if self.refresh_update_notice() { self.draw()?; }
+                continue;
+            }
             let event = event::read().context("reading Echo keyboard input")?;
             match event {
                 Event::Resize(_, _) => { self.draw()?; }
@@ -464,6 +481,29 @@ impl Terminal {
         }
     }
 
+    fn refresh_update_notice(&mut self) -> bool {
+        let Some(receiver) = &self.update_check else { return false; };
+        let outcome = match receiver.try_recv() {
+            Ok(outcome) => outcome,
+            Err(TryRecvError::Empty) => return false,
+            Err(TryRecvError::Disconnected) => {
+                self.update_check = None;
+                return false;
+            }
+        };
+        self.update_check = None;
+        match outcome {
+            Ok(Some(version)) => {
+                if let Some(screen) = &self.screen {
+                    screen.borrow_mut().update_version = Some(version.to_string());
+                }
+                true
+            }
+            Ok(None) => false,
+            Err(_) => false,
+        }
+    }
+
     fn log(&self, message: &str, tone: Tone) {
         if let Some(screen) = &self.screen {
             let mut screen = screen.borrow_mut();
@@ -534,12 +574,27 @@ impl Terminal {
             return Ok(());
         }
         let brand = format!("  ◇  AMITY ECHO  v{}", env!("CARGO_PKG_VERSION"));
-        self.at(&mut out, 0, 0, width, &brand, Tone::Brand)?;
-        let right = format!("{}  ·  {}", screen.project, screen.model);
-        let right_width = right.chars().count();
-        if right_width + brand.chars().count() + 4 < width {
-            self.at(&mut out, (width - right_width - 2) as u16, 0, right_width,
-                &right, Tone::Info)?;
+        if let Some(version) = &screen.update_version {
+            let full = format!("Update v{version} available · echocli update");
+            let command = "echocli update";
+            let label = if brand.chars().count() + full.chars().count() + 4 < width {
+                full.as_str()
+            } else { command };
+            if brand.chars().count() + label.chars().count() + 4 < width {
+                self.at(&mut out, 0, 0, width, &brand, Tone::Brand)?;
+                self.at(&mut out, (width - label.chars().count() - 2) as u16,
+                    0, label.chars().count(), label, Tone::Warning)?;
+            } else {
+                self.at(&mut out, 0, 0, width, label, Tone::Warning)?;
+            }
+        } else {
+            self.at(&mut out, 0, 0, width, &brand, Tone::Brand)?;
+            let right = format!("{}  ·  {}", screen.project, screen.model);
+            let right_width = right.chars().count();
+            if right_width + brand.chars().count() + 4 < width {
+                self.at(&mut out, (width - right_width - 2) as u16, 0, right_width,
+                    &right, Tone::Info)?;
+            }
         }
         self.at(&mut out, 2, 1, width.saturating_sub(4),
             &screen.cwd.display().to_string(), Tone::Muted)?;
