@@ -6,7 +6,13 @@ Amity Echo is a local Rust coding agent launched as `echocli`. It keeps its own 
 
 Echo needs an initialized Amity project, its existing host JSON configuration, an `amity` host executable, and `AMITY_HOST_TOKEN` in the calling environment. The token is passed to the host process and is not saved in Echo configuration. The selected Amity host config must contain a configured `model_command`, `model_version`, and authorized `model_actor_id` for agent work. The model command follows Amity's `ModelInput` JSON on stdin and `ModelTurn` JSON on stdout contract. Echo does not provide an inference runtime or provision model membership.
 
-Install the Rust binary from this directory with `cargo install --path .`; this creates the `echocli` command.
+Install the Rust binary from this directory with `cargo install --path . --force`; this creates the `echocli` command. Existing installations need this one-time reinstall to add the update command.
+
+## Updates
+
+Windows x64 releases are published to the private [Amity Echo GitHub Releases](https://github.com/You-Know-Its-Me-Studios/Amity-Echo/releases) page. Install and authenticate the [GitHub CLI](https://cli.github.com/) with `gh auth login` using an account that can read this repository. Once a release is available, run `echocli update` from any directory, then start `echocli` again to use the new binary. Echo retrieves the latest published release and verifies its Windows executable against the release's SHA-256 checksum. Echo's local configuration and sessions are separate from the executable.
+
+For maintainers, set the new version in `Cargo.toml`, commit it on `main`, then push a matching `v<version>` tag pointing to that commit. The tag starts the Windows release workflow. It builds `echocli-x86_64-pc-windows-msvc.exe` from the tracked `Cargo.lock` and publishes that asset with `echocli-x86_64-pc-windows-msvc.exe.sha256` in the same release. A source commit alone does not publish an update.
 
 `echocli` opens Echo's full-screen terminal from any directory, including before a project is connected. The composer remains available; `/project add <amity-host.json>` and `/config host <amity-executable>` connect the existing Amity infrastructure. Press Ctrl+C at the idle composer to return to the shell. During model or host work, Ctrl+C cancels the active operation. Project instructions need a connected, authorized Amity project and a configured model.
 

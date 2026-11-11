@@ -1,0 +1,59 @@
+name: Release Echo for Windows
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Require tag commit on main
+        shell: pwsh
+        run: |
+          git merge-base --is-ancestor $env:GITHUB_SHA origin/main
+          if ($LASTEXITCODE -ne 0) {
+            throw "Release tag must point to a commit on main"
+          }
+
+      - name: Match release tag to Cargo version
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"' | Select-Object -First 1).Matches.Groups[1].Value
+          if ($env:GITHUB_REF_NAME -ne "v$version") {
+            throw "Release tag $env:GITHUB_REF_NAME does not match Cargo version v$version"
+          }
+
+      - name: Build Windows CLI
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal
+          cargo +1.95.0 build --release --locked --target x86_64-pc-windows-msvc
+
+      - name: Prepare release assets
+        shell: pwsh
+        run: |
+          $asset = "echocli-x86_64-pc-windows-msvc.exe"
+          Copy-Item -LiteralPath "target/x86_64-pc-windows-msvc/release/echocli.exe" -Destination $asset
+          $digest = (Get-FileHash -LiteralPath $asset -Algorithm SHA256).Hash.ToLowerInvariant()
+          Set-Content -LiteralPath "$asset.sha256" -Encoding ascii -Value "$digest  $asset"
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create $env:GITHUB_REF_NAME `
+            ./echocli-x86_64-pc-windows-msvc.exe `
+            ./echocli-x86_64-pc-windows-msvc.exe.sha256 `
+            --verify-tag --latest --title "Amity Echo $env:GITHUB_REF_NAME" --generate-notes

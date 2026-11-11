@@ -4,6 +4,7 @@ mod host;
 mod model;
 mod state;
 mod terminal;
+mod update;
 
 use agent::Agent;
 use anyhow::{Context, Result, bail};
@@ -24,6 +25,11 @@ fn main() {
 }
 
 fn run() -> Result<()> {
+    let args: Vec<String> = env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("update") {
+        if args.len() != 1 { bail!("usage: echocli update"); }
+        return update::run();
+    }
     let mut config = Config::load().context("loading Echo configuration")?;
     let cwd = env::current_dir().context("reading current directory")?;
     let mut auto_registration_error = None;
@@ -42,7 +48,6 @@ fn run() -> Result<()> {
             config.save()?;
         }
     }
-    let args: Vec<String> = env::args().skip(1).collect();
     if args.iter().any(|arg| arg == "--help" || arg == "-h") || args.first().map(String::as_str) == Some("help") {
         print_help();
         return Ok(());
@@ -550,6 +555,7 @@ echocli task-steps <plan.json>    Run a structured multistep Amity task\n\
 echocli resume [session-id]      Reopen a session\n\
 echocli sessions                 List project sessions\n\
 echocli status                   Inspect active task\n\
+echocli update                   Install the latest GitHub Release\n\
 echocli review                   Show pending gateway proposal\n\
 echocli approve --yes            Explicitly approve and execute pending proposal\n\
 echocli continue | interrupt | cancel | raw  Manage or inspect active task\n\
