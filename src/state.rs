@@ -1,0 +1,241 @@
+use crate::config::{Config, invalid};
+use serde::{Deserialize, Serialize};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, ErrorKind, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Session {
+    pub id: String,
+    pub project_id: String,
+    pub model: Option<String>,
+    pub created_at_ms: u128,
+    pub updated_at_ms: u128,
+    pub status: SessionStatus,
+    pub messages: Vec<Message>,
+    pub task_ids: Vec<String>,
+    pub active_task: Option<String>,
+    pub active_step: Option<String>,
+    pub pending_approval: Option<String>,
+}
+
+impl Session {
+    pub fn append_message(&mut self, role: MessageRole, content: impl AsRef<str>) {
+        self.messages.push(Message {
+            role,
+            content: redact_credentials(content.as_ref()),
+            created_at_ms: now_ms(),
+        });
+        self.updated_at_ms = now_ms();
+    }
+
+    pub fn link_task(&mut self, task_id: impl Into<String>) {
+        let task_id = task_id.into();
+        if !self.task_ids.contains(&task_id) {
+            self.task_ids.push(task_id.clone());
+        }
+        self.active_task = Some(task_id);
+        self.status = SessionStatus::Running;
+        self.updated_at_ms = now_ms();
+    }
+
+    pub fn set_status(&mut self, status: SessionStatus) {
+        self.status = status;
+        self.updated_at_ms = now_ms();
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionStatus {
+    Idle,
+    Running,
+    WaitingApproval,
+    Interrupted,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Message {
+    pub role: MessageRole,
+    pub content: String,
+    pub created_at_ms: u128,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageRole { User, Assistant, Tool, System }
+
+pub struct SessionStore {
+    dir: PathBuf,
+}
+
+impl SessionStore {
+    pub fn new(config: &Config) -> io::Result<Self> {
+        fs::create_dir_all(&config.session_dir)?;
+        Ok(Self { dir: config.session_dir.clone() })
+    }
+
+    pub fn create(&self, project_id: &str, model: Option<String>) -> io::Result<Session> {
+        if project_id.trim().is_empty() {
+            return Err(invalid("session project ID cannot be empty"));
+        }
+        let now = now_ms();
+        let session = Session {
+            id: new_id(), project_id: project_id.to_owned(), model,
+            created_at_ms: now, updated_at_ms: now,
+            status: SessionStatus::Idle, messages: Vec::new(), task_ids: Vec::new(),
+            active_task: None, active_step: None, pending_approval: None,
+        };
+        self.save(&session)?;
+        Ok(session)
+    }
+
+    pub fn load(&self, id: &str) -> io::Result<Session> {
+        validate_id(id)?;
+        let path = self.path_for(id);
+        let bytes = fs::read(&path)?;
+        let session: Session = serde_json::from_slice(&bytes)
+            .map_err(|e| invalid(format!("invalid session {}: {e}", path.display())))?;
+        if session.id != id {
+            return Err(invalid(format!("session ID mismatch in {}", path.display())));
+        }
+        Ok(session)
+    }
+
+    pub fn save(&self, session: &Session) -> io::Result<()> {
+        validate_id(&session.id)?;
+        let mut safe = session.clone();
+        for message in &mut safe.messages {
+            message.content = redact_credentials(&message.content);
+        }
+        write_json_atomic(&self.path_for(&session.id), &safe)
+    }
+
+    pub fn list(&self, project_id: Option<&str>) -> io::Result<Vec<Session>> {
+        let mut sessions = Vec::new();
+        for entry in fs::read_dir(&self.dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") { continue; }
+            let bytes = fs::read(&path)?;
+            let session: Session = serde_json::from_slice(&bytes)
+                .map_err(|e| invalid(format!("invalid session {}: {e}", path.display())))?;
+            if project_id.is_none_or(|id| session.project_id == id) {
+                sessions.push(session);
+            }
+        }
+        sessions.sort_by(|a, b| b.updated_at_ms.cmp(&a.updated_at_ms).then_with(|| b.id.cmp(&a.id)));
+        Ok(sessions)
+    }
+
+    pub fn latest(&self, project_id: &str) -> io::Result<Option<Session>> {
+        Ok(self.list(Some(project_id))?.into_iter().next())
+    }
+
+    fn path_for(&self, id: &str) -> PathBuf { self.dir.join(format!("{id}.json")) }
+}
+
+fn validate_id(id: &str) -> io::Result<()> {
+    if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-') {
+        return Err(invalid("invalid session ID"));
+    }
+    Ok(())
+}
+
+fn now_ms() -> u128 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis()
+}
+
+fn new_id() -> String {
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+    let sequence = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    format!("{nanos:x}-{:x}-{sequence:x}", std::process::id())
+}
+
+pub(crate) fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
+    let parent = path.parent().ok_or_else(|| invalid("storage path has no parent"))?;
+    fs::create_dir_all(parent)?;
+    let data = serde_json::to_vec_pretty(value)
+        .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
+    let suffix = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let name = path.file_name().ok_or_else(|| invalid("storage path has no file name"))?;
+    let temp = parent.join(format!("{}.tmp-{}-{}-{suffix}", name.to_string_lossy(), std::process::id(), now_ms()));
+    let write_result = (|| {
+        let mut file = OpenOptions::new().write(true).create_new(true).open(&temp)?;
+        file.write_all(&data)?;
+        file.sync_all()?;
+        replace_file(&temp, path)
+    })();
+    if write_result.is_err() { let _ = fs::remove_file(&temp); }
+    write_result
+}
+
+#[cfg(not(windows))]
+fn replace_file(temp: &Path, target: &Path) -> io::Result<()> {
+    fs::rename(temp, target)
+}
+
+#[cfg(windows)]
+fn replace_file(temp: &Path, target: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "Kernel32")]
+    unsafe extern "system" {
+        fn ReplaceFileW(replaced: *const u16, replacement: *const u16, backup: *const u16,
+            flags: u32, exclude: *const core::ffi::c_void, reserved: *const core::ffi::c_void) -> i32;
+    }
+    if !target.exists() { return fs::rename(temp, target); }
+    let replaced: Vec<u16> = target.as_os_str().encode_wide().chain(Some(0)).collect();
+    let replacement: Vec<u16> = temp.as_os_str().encode_wide().chain(Some(0)).collect();
+    let result = unsafe {
+        ReplaceFileW(replaced.as_ptr(), replacement.as_ptr(), std::ptr::null(), 0,
+            std::ptr::null(), std::ptr::null())
+    };
+    if result == 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
+}
+
+pub(crate) fn redact_credentials(text: &str) -> String {
+    let mut output = String::new();
+    for line in text.split_inclusive('\n') {
+        let lower = line.to_ascii_lowercase();
+        let sensitive_assignment = ["amity_host_token=", "amity_host_token:", "authorization: bearer ",
+            "api_key=", "api_key:", "api-key=", "api-key:", "access_token=", "access_token:",
+            "refresh_token=", "refresh_token:", "client_secret=", "client_secret:",
+            "password=", "password:"];
+        if sensitive_assignment.iter().any(|needle| lower.contains(needle)) {
+            output.push_str("[redacted credential]");
+            if line.ends_with('\n') { output.push('\n'); }
+            continue;
+        }
+        output.push_str(&redact_inline_tokens(line));
+    }
+    output
+}
+
+fn redact_inline_tokens(line: &str) -> String {
+    let prefixes = ["sk-", "ghp_", "gho_", "github_pat_", "glpat-", "xoxb-", "xoxp-"];
+    let mut output = String::new();
+    let mut rest = line;
+    while !rest.is_empty() {
+        let next = prefixes.iter().filter_map(|prefix| rest.find(prefix).map(|index| (index, *prefix)))
+            .min_by_key(|(index, _)| *index);
+        let Some((index, prefix)) = next else { output.push_str(rest); break; };
+        output.push_str(&rest[..index]);
+        let tail = &rest[index + prefix.len()..];
+        let token_len = tail.find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '`' | ',' | ';' | ')' | ']'))
+            .unwrap_or(tail.len());
+        if token_len >= 8 {
+            output.push_str("[redacted credential]");
+        } else {
+            output.push_str(prefix);
+            output.push_str(&tail[..token_len]);
+        }
+        rest = &tail[token_len..];
+    }
+    output
+}
