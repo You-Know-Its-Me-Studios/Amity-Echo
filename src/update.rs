@@ -1,25 +1,27 @@
-//! Download and install an authenticated GitHub Release of Echo.
+//! Download and install a public GitHub Release of Echo.
 
 use std::fmt::Write as _;
 use std::fs::{self, File};
-use std::io::Read;
-use std::process::{Command, Output};
+use std::io::{self, Read};
+use std::path::Path;
+use std::time::Duration;
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use semver::Version;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 const REPOSITORY: &str = "You-Know-Its-Me-Studios/Amity-Echo";
+const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/You-Know-Its-Me-Studios/Amity-Echo/releases/latest";
 const EXECUTABLE_ASSET: &str = "echocli-x86_64-pc-windows-msvc.exe";
 const CHECKSUM_ASSET: &str = "echocli-x86_64-pc-windows-msvc.exe.sha256";
+const MAX_EXECUTABLE_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct Release {
     tag_name: String,
-    is_draft: bool,
-    is_prerelease: bool,
+    draft: bool,
+    prerelease: bool,
     assets: Vec<ReleaseAsset>,
 }
 
@@ -34,14 +36,23 @@ pub fn run() -> Result<()> {
         "Echo updates currently support Windows x64 MSVC only"
     );
 
+    let client = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(120)))
+            .https_only(true)
+            .build(),
+    );
     println!("Checking GitHub Releases for Amity Echo...");
-    let output = github(&[
-        "release", "view", "--repo", REPOSITORY,
-        "--json", "tagName,isDraft,isPrerelease,assets",
-    ])?;
-    let release: Release = serde_json::from_slice(&output.stdout)
-        .context("GitHub CLI returned invalid release metadata")?;
-    ensure!(!release.is_draft && !release.is_prerelease, "latest Echo release is not a stable published release");
+    let mut response = client.get(LATEST_RELEASE_URL)
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "Amity-Echo-Updater")
+        .call()
+        .context("requesting the latest public Echo release from GitHub")?;
+    let metadata = response.body_mut().with_config().limit(1024 * 1024)
+        .read_to_vec().context("reading Echo release metadata")?;
+    let release: Release = serde_json::from_slice(&metadata)
+        .context("GitHub returned invalid release metadata")?;
+    ensure!(!release.draft && !release.prerelease, "latest Echo release is not a stable published release");
     let remote_version = release.tag_name.strip_prefix('v')
         .context("Echo release tag must begin with v")
         .and_then(|version| Version::parse(version).context("Echo release tag has an invalid version"))?;
@@ -58,15 +69,10 @@ pub fn run() -> Result<()> {
 
     println!("Downloading Echo {}...", release.tag_name);
     let download = tempfile::tempdir().context("creating temporary update directory")?;
-    let destination = download.path().to_str().context("temporary update path is not Unicode")?;
-    github(&[
-        "release", "download", &release.tag_name, "--repo", REPOSITORY,
-        "--pattern", EXECUTABLE_ASSET, "--pattern", CHECKSUM_ASSET,
-        "--dir", destination,
-    ])?;
-
     let executable = download.path().join(EXECUTABLE_ASSET);
     let checksum = download.path().join(CHECKSUM_ASSET);
+    download_asset(&client, &release.tag_name, EXECUTABLE_ASSET, &executable, MAX_EXECUTABLE_BYTES)?;
+    download_asset(&client, &release.tag_name, CHECKSUM_ASSET, &checksum, 4096)?;
     verify_checksum(&executable, &checksum)?;
     self_replace::self_replace(&executable)
         .context("replacing the Echo executable; ensure its install directory is writable")?;
@@ -74,14 +80,19 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
-fn github(arguments: &[&str]) -> Result<Output> {
-    let output = Command::new("gh").args(arguments).output()
-        .context("GitHub CLI (gh) is required for updates from the private Echo repository; install gh and run `gh auth login`")?;
-    if !output.status.success() {
-        let detail = crate::state::redact_credentials(&String::from_utf8_lossy(&output.stderr));
-        bail!("GitHub release request failed: {}. Check `gh auth status` and your access to {REPOSITORY}.", detail.trim());
-    }
-    Ok(output)
+fn download_asset(client: &ureq::Agent, tag: &str, name: &str, path: &Path, maximum: u64) -> Result<()> {
+    let url = format!("https://github.com/{REPOSITORY}/releases/download/{tag}/{name}");
+    let mut response = client.get(&url)
+        .header("User-Agent", "Amity-Echo-Updater")
+        .call()
+        .with_context(|| format!("downloading {name} from GitHub Releases"))?;
+    let mut output = File::create(path)
+        .with_context(|| format!("creating temporary {name}"))?;
+    let mut reader = response.body_mut().as_reader().take(maximum + 1);
+    let downloaded = io::copy(&mut reader, &mut output)
+        .with_context(|| format!("reading release asset {name}"))?;
+    ensure!(downloaded <= maximum, "release asset {name} is too large");
+    Ok(())
 }
 
 fn verify_checksum(executable: &std::path::Path, checksum: &std::path::Path) -> Result<()> {

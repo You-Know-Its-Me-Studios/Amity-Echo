@@ -6,11 +6,13 @@ Amity Echo is a local Rust coding agent launched as `echocli`. It keeps its own 
 
 Echo needs an initialized Amity project, its existing host JSON configuration, an `amity` host executable, and `AMITY_HOST_TOKEN` in the calling environment. The token is passed to the host process and is not saved in Echo configuration. The selected Amity host config must contain a configured `model_command`, `model_version`, and authorized `model_actor_id` for agent work. The model command follows Amity's `ModelInput` JSON on stdin and `ModelTurn` JSON on stdout contract. Echo does not provide an inference runtime or provision model membership.
 
-Install the Rust binary from this directory with `cargo install --path . --force`; this creates the `echocli` command. Existing installations need this one-time reinstall to add the update command.
+Install the Rust binary from this directory with `cargo install --path . --force`; this creates the `echocli` command. Installations that predate the update command need this one-time reinstall.
 
 ## Updates
 
-Windows x64 releases are published to the private [Amity Echo GitHub Releases](https://github.com/You-Know-Its-Me-Studios/Amity-Echo/releases) page. Install and authenticate the [GitHub CLI](https://cli.github.com/) with `gh auth login` using an account that can read this repository. Once a release is available, run `echocli update` from any directory, then start `echocli` again to use the new binary. Echo retrieves the latest published release and verifies its Windows executable against the release's SHA-256 checksum. Echo's local configuration and sessions are separate from the executable.
+Windows x64 releases are published to the public [Amity Echo GitHub Releases](https://github.com/You-Know-Its-Me-Studios/Amity-Echo/releases) page. Run `echocli update` from any directory, then start `echocli` again to use the new binary. Echo downloads the latest published release over HTTPS and verifies its Windows executable against the release's SHA-256 checksum. No GitHub account or GitHub CLI is needed for version 0.1.2 and later. Echo's local configuration and sessions are separate from the executable.
+
+Version 0.1.1 still uses the GitHub CLI for its own update command. To move from 0.1.1 to 0.1.2, use that command with an authenticated `gh`, or reinstall once from this checkout with `cargo install --path . --force`.
 
 For maintainers, set the new version in `Cargo.toml`, commit it on `main`, then push a matching `v<version>` tag pointing to that commit. The tag starts the Windows release workflow. It builds `echocli-x86_64-pc-windows-msvc.exe` from the tracked `Cargo.lock` and publishes that asset with `echocli-x86_64-pc-windows-msvc.exe.sha256` in the same release. A source commit alone does not publish an update.
 
