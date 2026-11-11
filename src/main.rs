@@ -67,12 +67,12 @@ fn run() -> Result<()> {
     }
     match args.first().map(String::as_str) {
         None => {
+            terminal.enter_interactive(&cwd)?;
             if config.active_project().is_some() {
                 let session = current_session(&config, &store)?;
-                terminal.info(&format!("Working directory: {}", cwd.display()));
                 interactive(&mut config, &store, &mut terminal, cancel.as_ref(), session)
             } else {
-                interactive_without_project(&mut config, &store, &mut terminal, cancel.as_ref(), &cwd)
+                interactive_without_project(&mut config, &store, &mut terminal, cancel.as_ref())
             }
         }
         Some("resume") => {
@@ -86,6 +86,7 @@ fn run() -> Result<()> {
                 config.select_project(&session.project_id)?;
                 config.save()?;
             }
+            terminal.enter_interactive(&cwd)?;
             interactive(&mut config, &store, &mut terminal, cancel.as_ref(), session)
         }
         Some("sessions") => list_sessions(&store, config.active_project.as_deref(), &terminal),
@@ -199,23 +200,23 @@ fn current_session(config: &Config, store: &SessionStore) -> Result<Session> {
 }
 
 fn interactive_without_project(config: &mut Config, store: &SessionStore, terminal: &mut Terminal,
-    cancel: &AtomicBool, cwd: &std::path::Path) -> Result<()> {
-    terminal.banner("no project", "setup", "unconfigured");
-    terminal.info(&format!("Working directory: {}", cwd.display()));
-    terminal.info("Use /project add <amity-host.json> to connect an existing Amity project, or /project use <id>.");
+    cancel: &AtomicBool) -> Result<()> {
+    terminal.banner("Local workspace", "new", "not connected");
     loop {
         cancel.store(false, Ordering::Relaxed);
-        match terminal.read_line("no project", "setup")? {
+        match terminal.read_line("Local workspace", "new")? {
             Input::Eof => return Ok(()),
-            Input::Interrupt => { cancel.store(false, Ordering::Relaxed); terminal.info("Input interrupted."); }
+            Input::Interrupt => return Ok(()),
             Input::Line(line) => {
                 let line = line.trim();
                 if line.is_empty() { continue; }
                 if line == "/exit" || line == "/quit" { return Ok(()); }
-                if line == "/help" { print_interactive_help(); continue; }
-                if line == "/projects" { list_projects(config); continue; }
+                if line == "/help" { print_interactive_help(terminal); continue; }
+                if line == "/projects" { terminal.raw(&projects_text(config)); continue; }
                 if line == "/sessions" { list_sessions(store, None, terminal)?; continue; }
-                if line == "/config" { show_config(config)?; continue; }
+                if line == "/config" { terminal.raw(&config_text(config)?); continue; }
+                if line == "/status" { terminal.info("Amity is not connected to this workspace."); continue; }
+                if line == "/models" { terminal.info("Connect an Amity project to see its model profiles."); continue; }
                 if let Some(id) = line.strip_prefix("/resume ") {
                     let result = store.load(id.trim()).map_err(anyhow::Error::from)
                         .and_then(|session| {
@@ -262,7 +263,11 @@ fn interactive_without_project(config: &mut Config, store: &SessionStore, termin
                     }
                     continue;
                 }
-                terminal.warning("Connect an authorized Amity project before sending instructions. Use /project add <amity-host.json>.");
+                if line.starts_with('/') {
+                    terminal.warning("Unknown command. Type /help for shortcuts.");
+                } else {
+                    terminal.warning("Amity project and model are not connected. Use /project add <amity-host.json>, then send your task again.");
+                }
             }
         }
     }
@@ -281,16 +286,16 @@ fn interactive(config: &mut Config, store: &SessionStore, terminal: &mut Termina
         cancel.store(false, Ordering::Relaxed);
         match terminal.read_line(&session.project_id, &session.id)? {
             Input::Eof => return Ok(()),
-            Input::Interrupt => { cancel.store(false, Ordering::Relaxed); terminal.info("Input interrupted. Use /cancel to cancel an Amity task."); }
+            Input::Interrupt => return Ok(()),
             Input::Line(line) => {
                 let line = line.trim();
                 if line.is_empty() { continue; }
                 if line == "/exit" || line == "/quit" { return Ok(()); }
-                if line == "/help" { print_interactive_help(); continue; }
+                if line == "/help" { print_interactive_help(terminal); continue; }
                 if line == "/sessions" { list_sessions(store, Some(&session.project_id), terminal)?; continue; }
-                if line == "/projects" { list_projects(config); continue; }
-                if line == "/models" { list_models(config); continue; }
-                if line == "/config" { show_config(config)?; continue; }
+                if line == "/projects" { terminal.raw(&projects_text(config)); continue; }
+                if line == "/models" { terminal.raw(&models_text(config)); continue; }
+                if line == "/config" { terminal.raw(&config_text(config)?); continue; }
                 if let Some(path) = line.strip_prefix("/config host ") {
                     config.host_executable = PathBuf::from(path.trim().trim_matches('"'));
                     if let Err(error) = config.save() { terminal.error(&error.to_string()); }
@@ -351,6 +356,7 @@ fn interactive(config: &mut Config, store: &SessionStore, terminal: &mut Termina
                         config.save()?;
                         session.model = model.map(str::to_owned);
                         store.save(&session)?;
+                        terminal.context(&session.project_id, &session.id, model.unwrap_or("default"));
                         terminal.info(&format!("Selected Amity model profile {}", model.unwrap_or("default")));
                         Ok(())
                     })();
@@ -411,25 +417,41 @@ fn list_sessions(store: &SessionStore, project_id: Option<&str>, terminal: &Term
 }
 
 fn list_projects(config: &Config) {
+    print!("{}", projects_text(config));
+}
+
+fn projects_text(config: &Config) -> String {
+    let mut output = String::new();
+    if config.projects.is_empty() { return "No Amity projects registered.\n".into(); }
     for project in &config.projects {
         let mark = if config.active_project.as_deref() == Some(&project.id) { "*" } else { " " };
-        println!("{mark} {}  {}  {}", project.id, project.path.display(), project.host_config.display());
+        output.push_str(&format!("{mark} {}  {}  {}\n", project.id, project.path.display(), project.host_config.display()));
     }
+    output
 }
 
 fn list_models(config: &Config) {
+    print!("{}", models_text(config));
+}
+
+fn models_text(config: &Config) -> String {
+    let mut output = String::new();
     if let Some(project) = config.active_project() {
-        println!("{} default  {}", if project.selected_model.is_none() { "*" } else { " " }, project.host_config.display());
+        output.push_str(&format!("{} default  {}\n", if project.selected_model.is_none() { "*" } else { " " }, project.host_config.display()));
         for model in &project.models {
-            println!("{} {}  {}", if project.selected_model.as_deref() == Some(&model.name) { "*" } else { " " }, model.name, model.host_config.display());
+            output.push_str(&format!("{} {}  {}\n", if project.selected_model.as_deref() == Some(&model.name) { "*" } else { " " }, model.name, model.host_config.display()));
         }
     }
+    output
 }
 
 fn show_config(config: &Config) -> Result<()> {
-    println!("Echo config: {}", Config::path().display());
-    println!("{}", serde_json::to_string_pretty(config)?);
+    print!("{}", config_text(config)?);
     Ok(())
+}
+
+fn config_text(config: &Config) -> Result<String> {
+    Ok(format!("Echo config: {}\n{}\n", Config::path().display(), serde_json::to_string_pretty(config)?))
 }
 
 fn config_command(config: &mut Config, args: &[String]) -> Result<()> {
@@ -542,8 +564,8 @@ AMITY_HOST_TOKEN is read from the environment and never stored by Echo.\n\
 AMITY_HOST_CONFIG can register its bound project on first launch.");
 }
 
-fn print_interactive_help() {
-    println!("/help  /status  /review  /approve  /continue  /retry  /interrupt  /cancel  /raw\n\
+fn print_interactive_help(terminal: &Terminal) {
+    terminal.raw("/help  /status  /review  /approve  /continue  /retry  /interrupt  /cancel  /raw\n\
 /tools  /report  /reconcile  /task-steps <plan.json>\n\
 /sessions  /resume <id>  /session new  /projects  /project add <amity-host.json>  /project <id>\n\
 /models  /model <name|default>  /config host <amity-executable>  /task <instruction>  /exit");

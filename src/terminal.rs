@@ -2,11 +2,17 @@
 //! this module only collects input and renders their state.
 
 use std::env;
+use std::cell::RefCell;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use crossterm::{execute, queue};
+use crossterm::cursor::{Hide, MoveTo, Show};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::style::{Color, Print, ResetColor, SetForegroundColor};
+use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 
@@ -21,6 +27,30 @@ pub struct Terminal {
     editor: Option<DefaultEditor>,
     history_path: PathBuf,
     color: bool,
+    screen: Option<RefCell<Screen>>,
+}
+
+#[derive(Clone, Copy)]
+enum Tone { Brand, Muted, User, Assistant, Info, Warning, Error, Operation, Tool, Code }
+
+struct ScreenLine { text: String, tone: Tone }
+
+struct Screen {
+    cwd: PathBuf,
+    project: String,
+    session: String,
+    model: String,
+    lines: Vec<ScreenLine>,
+    input: String,
+    cursor: usize,
+    scroll: usize,
+    status: String,
+    approval: bool,
+    raw: bool,
+    history: Vec<String>,
+    history_position: Option<usize>,
+    saved_draft: String,
+    engaged: bool,
 }
 
 impl Terminal {
@@ -36,10 +66,37 @@ impl Terminal {
                 && io::stdout().is_terminal()
                 && env::var_os("NO_COLOR").is_none()
                 && env::var("TERM").ok().as_deref() != Some("dumb"),
+            screen: None,
         })
     }
 
+    pub fn enter_interactive(&mut self, cwd: &Path) -> Result<()> {
+        if self.screen.is_some() || !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+            return Ok(());
+        }
+        if let Err(error) = execute!(io::stdout(), EnterAlternateScreen, Hide) {
+            let _ = execute!(io::stdout(), Show, LeaveAlternateScreen);
+            return Err(error).context("opening Echo terminal screen");
+        }
+        self.screen = Some(RefCell::new(Screen {
+            cwd: cwd.to_path_buf(), project: "Local workspace".into(), session: "new".into(),
+            model: "not connected".into(), lines: Vec::new(), input: String::new(),
+            cursor: 0, scroll: 0, status: "Ready".into(), approval: false, raw: false,
+            history: Vec::new(), history_position: None, saved_draft: String::new(),
+            engaged: false,
+        }));
+        self.draw().context("drawing Echo terminal screen")
+    }
+
     pub fn read_line(&mut self, project: &str, session: &str) -> Result<Input> {
+        if self.screen.is_some() {
+            {
+                let mut screen = self.screen.as_ref().expect("screen is present").borrow_mut();
+                screen.project = project.to_owned();
+                screen.session = session.to_owned();
+            }
+            return self.read_screen_input(true);
+        }
         let prompt = format!(
             "{} {} {} ",
             self.paint("Echo", "1;36"),
@@ -50,6 +107,20 @@ impl Terminal {
     }
 
     pub fn ask_approval(&mut self, description: &str) -> Result<bool> {
+        if self.screen.is_some() {
+            self.log(description, Tone::Warning);
+            self.screen.as_ref().expect("screen is present").borrow_mut().approval = true;
+            loop {
+                match self.read_screen_input(false)? {
+                    Input::Line(answer) => match answer.trim().to_ascii_lowercase().as_str() {
+                        "y" | "yes" => { self.screen.as_ref().expect("screen is present").borrow_mut().approval = false; return Ok(true); }
+                        "" | "n" | "no" => { self.screen.as_ref().expect("screen is present").borrow_mut().approval = false; return Ok(false); }
+                        _ => self.log("Enter y or n.", Tone::Info),
+                    },
+                    Input::Interrupt | Input::Eof => { self.screen.as_ref().expect("screen is present").borrow_mut().approval = false; return Ok(false); }
+                }
+            }
+        }
         self.warning(description);
         loop {
             let prompt = format!("{} ", self.paint("Approve this operation? [y/N]", "1;33"));
@@ -62,6 +133,248 @@ impl Terminal {
                 Input::Interrupt | Input::Eof => return Ok(false),
             }
         }
+    }
+
+    fn read_screen_input(&mut self, record_input: bool) -> Result<Input> {
+        terminal::enable_raw_mode().context("enabling Echo keyboard input")?;
+        self.screen.as_ref().expect("screen is present").borrow_mut().raw = true;
+        let result = self.screen_input_loop(record_input);
+        let disable = terminal::disable_raw_mode().context("restoring normal terminal input");
+        if disable.is_ok() {
+            self.screen.as_ref().expect("screen is present").borrow_mut().raw = false;
+        }
+        disable?;
+        result
+    }
+
+    fn screen_input_loop(&mut self, record_input: bool) -> Result<Input> {
+        self.draw()?;
+        loop {
+            let event = event::read().context("reading Echo keyboard input")?;
+            match event {
+                Event::Resize(_, _) => { self.draw()?; }
+                Event::Key(key) if key.kind != KeyEventKind::Release => {
+                    let mut submitted = None;
+                    let mut finished = None;
+                    {
+                        let mut screen = self.screen.as_ref().expect("screen is present").borrow_mut();
+                        match key.code {
+                            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                screen.input.clear(); screen.cursor = 0;
+                                finished = Some(Input::Interrupt);
+                            }
+                            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) && screen.input.is_empty() => {
+                                finished = Some(Input::Eof);
+                            }
+                            KeyCode::Enter => {
+                                let line = std::mem::take(&mut screen.input);
+                                screen.cursor = 0;
+                                screen.history_position = None;
+                                screen.saved_draft.clear();
+                                if record_input && !line.trim().is_empty() {
+                                    screen.history.push(line.clone());
+                                    if screen.history.len() > 100 { screen.history.remove(0); }
+                                    submitted = Some(line.clone());
+                                }
+                                finished = Some(Input::Line(line));
+                            }
+                            KeyCode::Backspace if screen.cursor > 0 => {
+                                let end = byte_index(&screen.input, screen.cursor);
+                                let start = byte_index(&screen.input, screen.cursor - 1);
+                                screen.input.replace_range(start..end, "");
+                                screen.cursor -= 1;
+                            }
+                            KeyCode::Delete if screen.cursor < screen.input.chars().count() => {
+                                let start = byte_index(&screen.input, screen.cursor);
+                                let end = byte_index(&screen.input, screen.cursor + 1);
+                                screen.input.replace_range(start..end, "");
+                            }
+                            KeyCode::Left => screen.cursor = screen.cursor.saturating_sub(1),
+                            KeyCode::Right => screen.cursor = (screen.cursor + 1).min(screen.input.chars().count()),
+                            KeyCode::Home => screen.cursor = 0,
+                            KeyCode::End => screen.cursor = screen.input.chars().count(),
+                            KeyCode::PageUp => screen.scroll = screen.scroll.saturating_add(8),
+                            KeyCode::PageDown => screen.scroll = screen.scroll.saturating_sub(8),
+                            KeyCode::Up if !screen.history.is_empty() => {
+                                if screen.history_position.is_none() { screen.saved_draft = screen.input.clone(); }
+                                let position = screen.history_position.unwrap_or(screen.history.len()).saturating_sub(1);
+                                screen.history_position = Some(position);
+                                screen.input = screen.history[position].clone();
+                                screen.cursor = screen.input.chars().count();
+                            }
+                            KeyCode::Down => {
+                                if let Some(position) = screen.history_position {
+                                    if position + 1 < screen.history.len() {
+                                        screen.history_position = Some(position + 1);
+                                        screen.input = screen.history[position + 1].clone();
+                                    } else {
+                                        screen.history_position = None;
+                                        screen.input = screen.saved_draft.clone();
+                                    }
+                                    screen.cursor = screen.input.chars().count();
+                                }
+                            }
+                            KeyCode::Esc => { screen.input.clear(); screen.cursor = 0; screen.history_position = None; }
+                            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                screen.input.clear(); screen.cursor = 0;
+                            }
+                            KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) && screen.input.len() < 16 * 1024 => {
+                                let index = byte_index(&screen.input, screen.cursor);
+                                screen.input.insert(index, ch);
+                                screen.cursor += 1;
+                            }
+                            _ => {}
+                        }
+                    }
+                    if let Some(line) = submitted { self.log(&format!("› {line}"), Tone::User); }
+                    if let Some(input) = finished { return Ok(input); }
+                    self.draw()?;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn log(&self, message: &str, tone: Tone) {
+        let safe = Self::clean(&crate::state::redact_credentials(message));
+        if let Some(screen) = &self.screen {
+            let mut screen = screen.borrow_mut();
+            if matches!(tone, Tone::Operation) { screen.status = safe.clone(); }
+            if matches!(tone, Tone::Assistant) { screen.status = "Ready".into(); }
+            if matches!(tone, Tone::User | Tone::Assistant | Tone::Operation | Tone::Tool | Tone::Code) {
+                screen.engaged = true;
+            }
+            let mut in_code = false;
+            for line in safe.split('\n') {
+                let line_tone = if matches!(tone, Tone::Assistant) {
+                    let trimmed = line.trim_start();
+                    if trimmed.starts_with("```") {
+                        in_code = !in_code;
+                        Tone::Muted
+                    } else if in_code {
+                        Tone::Code
+                    } else if trimmed.starts_with("# ") || trimmed.starts_with("## ") || trimmed.starts_with("### ") {
+                        Tone::Brand
+                    } else {
+                        Tone::Assistant
+                    }
+                } else {
+                    tone
+                };
+                screen.lines.push(ScreenLine { text: line.to_owned(), tone: line_tone });
+            }
+            if screen.lines.len() > 4000 {
+                let excess = screen.lines.len() - 4000;
+                screen.lines.drain(..excess);
+            }
+            screen.scroll = 0;
+        }
+        let _ = self.draw();
+    }
+
+    fn draw(&self) -> Result<()> {
+        let Some(screen) = &self.screen else { return Ok(()); };
+        let screen = screen.borrow();
+        let (width, height) = terminal::size().context("reading terminal size")?;
+        let width = usize::from(width);
+        let height = usize::from(height);
+        if width == 0 || height == 0 { return Ok(()); }
+        let mut out = io::stdout();
+        queue!(out, MoveTo(0, 0), Clear(ClearType::All))?;
+        if height < 8 {
+            self.at(&mut out, 0, 0, width, " AMITY ECHO", Tone::Brand)?;
+            if height > 1 {
+                self.at(&mut out, 0, 1, width, " Enlarge this terminal window to continue.", Tone::Warning)?;
+            }
+            out.flush()?;
+            return Ok(());
+        }
+        if width < 5 {
+            self.at(&mut out, 0, 0, width, "Echo", Tone::Brand)?;
+            self.at(&mut out, 0, (height - 2) as u16, width.saturating_sub(1), &screen.input, Tone::Assistant)?;
+            queue!(out, MoveTo(0, (height - 2) as u16), Show)?;
+            out.flush()?;
+            return Ok(());
+        }
+        self.at(&mut out, 0, 0, width, "  ◇  AMITY ECHO", Tone::Brand)?;
+        let right = format!("{}  ·  {}", screen.project, screen.model);
+        let right_width = right.chars().count();
+        if right_width + 22 < width {
+            self.at(&mut out, (width - right_width - 2) as u16, 0, right_width,
+                &right, Tone::Info)?;
+        }
+        self.at(&mut out, 2, 1, width.saturating_sub(4),
+            &screen.cwd.display().to_string(), Tone::Muted)?;
+        self.at(&mut out, 2, 2, width.saturating_sub(4),
+            &format!("Session {}    Project {}    Model {}", screen.session, screen.project, screen.model), Tone::Info)?;
+        self.at(&mut out, 0, 3, width.saturating_sub(1), &"─".repeat(width.saturating_sub(1)), Tone::Muted)?;
+
+        let footer = height - 4;
+        let content_top = 4usize;
+        let content_height = footer.saturating_sub(content_top);
+        let content_width = width.saturating_sub(4).max(1);
+        let mut rows: Vec<(String, Tone)> = Vec::new();
+        for line in &screen.lines {
+            for part in wrap(&line.text, content_width) {
+                rows.push((part, line.tone));
+            }
+        }
+        if !screen.engaged {
+            let logo = [
+                ("◇", Tone::Brand),
+                ("A M I T Y   E C H O", Tone::Brand),
+                ("First-party engineering agent", Tone::Muted),
+                ("Describe a task or ask about your workspace", Tone::Info),
+                ("/help   /model   /projects   /sessions", Tone::Muted),
+            ];
+            let start = content_top + content_height.saturating_sub(logo.len()) / 2;
+            for (offset, (text, tone)) in logo.iter().enumerate() {
+                if start + offset >= footer { break; }
+                let length = text.chars().count();
+                let x = width.saturating_sub(length) / 2;
+                self.at(&mut out, x as u16, (start + offset) as u16,
+                    width.saturating_sub(x), text, *tone)?;
+            }
+        }
+        if !rows.is_empty() {
+            let max_scroll = rows.len().saturating_sub(content_height);
+            let scroll = screen.scroll.min(max_scroll);
+            let start = rows.len().saturating_sub(content_height + scroll);
+            let end = (start + content_height).min(rows.len());
+            for (offset, (text, tone)) in rows[start..end].iter().enumerate() {
+                self.at(&mut out, 2, (content_top + offset) as u16,
+                    content_width, text, *tone)?;
+            }
+        }
+
+        self.at(&mut out, 0, footer as u16, width.saturating_sub(1), &"─".repeat(width.saturating_sub(1)), Tone::Muted)?;
+        let prefix = if screen.approval { " Approve operation? [y/N]  " } else { " › " };
+        let prefix_width = prefix.chars().count().min(width.saturating_sub(1));
+        let input_width = width.saturating_sub(prefix_width + 1);
+        self.at(&mut out, 0, (footer + 1) as u16, width, prefix, Tone::Brand)?;
+        let first_visible = screen.cursor.saturating_sub(input_width.saturating_sub(1));
+        let visible: String = screen.input.chars().skip(first_visible).take(input_width).collect();
+        self.at(&mut out, prefix_width as u16, (footer + 1) as u16,
+            input_width, &visible, Tone::Assistant)?;
+        self.at(&mut out, 0, (footer + 2) as u16, width.saturating_sub(1), &"─".repeat(width.saturating_sub(1)), Tone::Muted)?;
+        let hint = if screen.approval { " Enter confirm · Ctrl+C decline" }
+            else { " Enter send  ·  Ctrl+C exit  ·  ↑↓ history  ·  PgUp/PgDn scroll" };
+        self.at(&mut out, 1, (footer + 3) as u16, width.saturating_sub(2), hint, Tone::Muted)?;
+        let status = truncate(&screen.status, width / 3);
+        if width > status.chars().count() + 75 {
+            self.at(&mut out, (width - status.chars().count() - 2) as u16,
+                (footer + 3) as u16, status.chars().count(), &status, Tone::Info)?;
+        }
+        let cursor_x = (prefix_width + screen.cursor.saturating_sub(first_visible)).min(width - 1) as u16;
+        queue!(out, MoveTo(cursor_x, (footer + 1) as u16), Show)?;
+        out.flush().context("drawing Echo terminal screen")
+    }
+
+    fn at(&self, out: &mut impl Write, x: u16, y: u16, width: usize,
+        text: &str, tone: Tone) -> io::Result<()> {
+        let text = truncate(text, width);
+        let color = if self.color { tone.color() } else { Color::White };
+        queue!(out, MoveTo(x, y), SetForegroundColor(color), Print(text), ResetColor)
     }
 
     fn read_with_prompt(&mut self, prompt: &str, record_history: bool) -> Result<Input> {
@@ -117,6 +430,16 @@ impl Terminal {
     }
 
     pub fn banner(&self, project: &str, session: &str, model: &str) {
+        if let Some(screen) = &self.screen {
+            {
+                let mut screen = screen.borrow_mut();
+                screen.project = project.to_owned();
+                screen.session = session.to_owned();
+                screen.model = model.to_owned();
+            }
+            let _ = self.draw();
+            return;
+        }
         println!("{}", self.paint("  Amity Echo", "1;36"));
         println!(
             "  {}  {}  {}",
@@ -124,10 +447,20 @@ impl Terminal {
             self.paint(&format!("Session: {session}"), "2"),
             self.paint(&format!("Model: {model}"), "2")
         );
-        println!("  Type /help for commands. Ctrl+C interrupts input; Ctrl+D exits.\n");
+        println!("  Type /help for commands. Ctrl+C or Ctrl+D exits.\n");
     }
 
     pub fn context(&self, project: &str, session: &str, model: &str) {
+        if let Some(screen) = &self.screen {
+            {
+                let mut screen = screen.borrow_mut();
+                screen.project = project.to_owned();
+                screen.session = session.to_owned();
+                screen.model = model.to_owned();
+            }
+            let _ = self.draw();
+            return;
+        }
         println!(
             "{} {} · {} · {}",
             self.paint("Echo", "1;36"),
@@ -138,29 +471,45 @@ impl Terminal {
     }
 
     pub fn assistant(&self, message: &str) {
+        if self.screen.is_some() {
+            self.log("ECHO", Tone::Brand);
+            self.log(message, Tone::Assistant);
+            self.log("", Tone::Muted);
+            return;
+        }
         println!("\n{}", self.paint("Echo", "1;36"));
         self.render_markdown(&Self::clean(&crate::state::redact_credentials(message)));
         println!();
     }
 
     pub fn info(&self, message: &str) {
+        if self.screen.is_some() { self.log(message, Tone::Info); return; }
         println!("{} {}", self.paint("•", "36"), Self::clean(&crate::state::redact_credentials(message)));
     }
 
     pub fn warning(&self, message: &str) {
+        if self.screen.is_some() { self.log(message, Tone::Warning); return; }
         eprintln!("{} {}", self.paint("!", "1;33"), Self::clean(&crate::state::redact_credentials(message)));
     }
 
     pub fn error(&self, message: &str) {
+        if self.screen.is_some() { self.log(message, Tone::Error); return; }
         eprintln!("{} {}", self.paint("Error:", "1;31"), Self::clean(&crate::state::redact_credentials(message)));
     }
 
     pub fn operation(&self, message: &str) {
+        if self.screen.is_some() { self.log(message, Tone::Operation); return; }
         println!("{} {}", self.paint("↳", "1;34"), Self::clean(&crate::state::redact_credentials(message)));
         let _ = io::stdout().flush();
     }
 
     pub fn tool_result(&self, name: &str, result: &str, success: bool) {
+        if self.screen.is_some() {
+            self.log(&format!("{} {name}", if success { "✓" } else { "×" }),
+                if success { Tone::Tool } else { Tone::Error });
+            self.log(result, Tone::Muted);
+            return;
+        }
         let icon = if success { "✓" } else { "×" };
         let style = if success { "32" } else { "31" };
         println!("{} {}", self.paint(icon, style), self.paint(name, "1"));
@@ -171,12 +520,18 @@ impl Terminal {
     }
 
     pub fn proposal(&self, title: &str, details: &str) {
+        if self.screen.is_some() {
+            self.log(&format!("PROPOSAL · {title}"), Tone::Warning);
+            self.log(details, Tone::Code);
+            return;
+        }
         println!("\n{} {}", self.paint("Proposal:", "1;33"), Self::clean(title));
         self.render_markdown(&Self::clean(&crate::state::redact_credentials(details)));
         println!();
     }
 
     pub fn raw(&self, value: &str) {
+        if self.screen.is_some() { self.log(value, Tone::Muted); return; }
         println!("{}", Self::clean(&crate::state::redact_credentials(value)));
     }
 
@@ -296,4 +651,44 @@ impl Terminal {
             .filter(|ch| *ch == '\n' || *ch == '\t' || !ch.is_control())
             .collect()
     }
+}
+
+impl Drop for Terminal {
+    fn drop(&mut self) {
+        if self.screen.take().is_none() { return; }
+        let _ = terminal::disable_raw_mode();
+        let _ = execute!(io::stdout(), ResetColor, Show, LeaveAlternateScreen);
+    }
+}
+
+impl Tone {
+    fn color(self) -> Color {
+        match self {
+            Self::Brand => Color::Cyan,
+            Self::Muted => Color::DarkGrey,
+            Self::User => Color::White,
+            Self::Assistant => Color::White,
+            Self::Info => Color::Blue,
+            Self::Warning => Color::Yellow,
+            Self::Error => Color::Red,
+            Self::Operation => Color::Magenta,
+            Self::Tool => Color::Green,
+            Self::Code => Color::DarkCyan,
+        }
+    }
+}
+
+fn truncate(text: &str, width: usize) -> String {
+    text.chars().take(width).collect()
+}
+
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let chars: Vec<char> = text.chars().collect();
+    if chars.is_empty() { return vec![String::new()]; }
+    chars.chunks(width).map(|part| part.iter().collect()).collect()
+}
+
+fn byte_index(text: &str, character_index: usize) -> usize {
+    text.char_indices().nth(character_index).map(|(index, _)| index).unwrap_or(text.len())
 }

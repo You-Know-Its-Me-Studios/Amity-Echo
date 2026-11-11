@@ -8,7 +8,7 @@ Echo needs an initialized Amity project, its existing host JSON configuration, a
 
 Install the Rust binary from this directory with `cargo install --path .`; this creates the `echocli` command.
 
-`echocli` opens the terminal from any directory, including before a project is connected. The setup prompt accepts `/project add <amity-host.json>` and `/config host <amity-executable>`. Project instructions need a connected, authorized Amity project and a configured model.
+`echocli` opens Echo's full-screen terminal from any directory, including before a project is connected. The composer remains available; `/project add <amity-host.json>` and `/config host <amity-executable>` connect the existing Amity infrastructure. Press Ctrl+C at the idle composer to return to the shell. During model or host work, Ctrl+C cancels the active operation. Project instructions need a connected, authorized Amity project and a configured model.
 
 ```powershell
 echocli config host "C:\path\to\amity.exe"
