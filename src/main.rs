@@ -26,9 +26,17 @@ fn main() {
 
 fn run() -> Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
+    if matches!(args.as_slice(), [version] if matches!(version.as_str(), "--version" | "-V" | "version")) {
+        println!("Amity Echo {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     if args.first().map(String::as_str) == Some("update") {
-        if args.len() != 1 { bail!("usage: echocli update"); }
-        return update::run();
+        let check_only = match args.as_slice() {
+            [_] => false,
+            [_, check] if check == "--check" => true,
+            _ => bail!("usage: echocli update [--check]"),
+        };
+        return update::run(check_only);
     }
     let mut config = Config::load().context("loading Echo configuration")?;
     let cwd = env::current_dir().context("reading current directory")?;
@@ -284,6 +292,7 @@ fn interactive(config: &mut Config, store: &SessionStore, terminal: &mut Termina
         bail!("session project is no longer registered");
     }
     terminal.banner(&session.project_id, &session.id, session.model.as_deref().unwrap_or("default"));
+    terminal.load_session(&session);
     if let Some(task_id) = session.active_task.as_deref() {
         terminal.info(&format!("Linked Amity task: {task_id}. Use /status or /continue."));
     }
@@ -313,6 +322,7 @@ fn interactive(config: &mut Config, store: &SessionStore, terminal: &mut Termina
                         if next.project_id != session.project_id { config.select_project(&next.project_id)?; config.save()?; }
                         session = next;
                         terminal.context(&session.project_id, &session.id, session.model.as_deref().unwrap_or("default"));
+                        terminal.load_session(&session);
                         Ok(())
                     })();
                     if let Err(error) = result { terminal.error(&format!("{error:#}")); }
@@ -323,6 +333,7 @@ fn interactive(config: &mut Config, store: &SessionStore, terminal: &mut Termina
                         let project = active_project(config)?;
                         session = store.create(&project.id, project.selected_model.clone())?;
                         terminal.context(&session.project_id, &session.id, session.model.as_deref().unwrap_or("default"));
+                        terminal.load_session(&session);
                         Ok(())
                     })();
                     if let Err(error) = result { terminal.error(&format!("{error:#}")); }
@@ -336,6 +347,7 @@ fn interactive(config: &mut Config, store: &SessionStore, terminal: &mut Termina
                         session = if let Some(existing) = store.latest(&id)? { existing }
                             else { store.create(&id, project.selected_model.clone())? };
                         terminal.context(&session.project_id, &session.id, session.model.as_deref().unwrap_or("default"));
+                        terminal.load_session(&session);
                         Ok(())
                     })();
                     if let Err(error) = result { terminal.error(&format!("{error:#}")); }
@@ -349,6 +361,7 @@ fn interactive(config: &mut Config, store: &SessionStore, terminal: &mut Termina
                         session = if let Some(existing) = store.latest(&id)? { existing }
                             else { store.create(&id, project.selected_model.clone())? };
                         terminal.context(&session.project_id, &session.id, session.model.as_deref().unwrap_or("default"));
+                        terminal.load_session(&session);
                         Ok(())
                     })();
                     if let Err(error) = result { terminal.error(&format!("{error:#}")); }
@@ -556,6 +569,8 @@ echocli resume [session-id]      Reopen a session\n\
 echocli sessions                 List project sessions\n\
 echocli status                   Inspect active task\n\
 echocli update                   Install the latest GitHub Release\n\
+echocli update --check           Check for a newer release\n\
+echocli --version                Show the installed Echo version\n\
 echocli review                   Show pending gateway proposal\n\
 echocli approve --yes            Explicitly approve and execute pending proposal\n\
 echocli continue | interrupt | cancel | raw  Manage or inspect active task\n\

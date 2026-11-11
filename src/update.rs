@@ -28,9 +28,11 @@ struct Release {
 #[derive(Deserialize)]
 struct ReleaseAsset {
     name: String,
+    size: u64,
+    digest: Option<String>,
 }
 
-pub fn run() -> Result<()> {
+pub fn run(check_only: bool) -> Result<()> {
     ensure!(
         cfg!(all(target_os = "windows", target_arch = "x86_64", target_env = "msvc")),
         "Echo updates currently support Windows x64 MSVC only"
@@ -58,29 +60,48 @@ pub fn run() -> Result<()> {
         .and_then(|version| Version::parse(version).context("Echo release tag has an invalid version"))?;
     let current_version = Version::parse(env!("CARGO_PKG_VERSION"))
         .context("installed Echo version is invalid")?;
+    let executable_asset = release.assets.iter().find(|asset| asset.name == EXECUTABLE_ASSET)
+        .with_context(|| format!("release {} has no Windows executable asset", release.tag_name))?;
+    let checksum_asset = release.assets.iter().find(|asset| asset.name == CHECKSUM_ASSET)
+        .with_context(|| format!("release {} has no checksum asset", release.tag_name))?;
+    println!("Installed: {current_version}  Latest: {remote_version}");
     if remote_version <= current_version {
-        println!("Echo is up to date (installed {current_version}, latest {remote_version}).");
+        println!("Echo is up to date.");
         return Ok(());
     }
-    ensure!(release.assets.iter().any(|asset| asset.name == EXECUTABLE_ASSET),
-        "release {} has no Windows executable asset", release.tag_name);
-    ensure!(release.assets.iter().any(|asset| asset.name == CHECKSUM_ASSET),
-        "release {} has no checksum asset", release.tag_name);
+    println!("Release: https://github.com/{REPOSITORY}/releases/tag/{}", release.tag_name);
+    if check_only {
+        println!("Update available. Run `echocli update` to install it.");
+        return Ok(());
+    }
+    ensure!(!cfg!(debug_assertions),
+        "this development build cannot update itself; install a release build of Echo first");
+    ensure!(!is_source_build()?,
+        "this source-tree build cannot update itself; use `cargo install --path . --force` instead");
+    ensure!(executable_asset.size <= MAX_EXECUTABLE_BYTES,
+        "release executable exceeds the 64 MiB download limit");
 
-    println!("Downloading Echo {}...", release.tag_name);
+    println!("Downloading Echo {} ({:.1} MiB)...", release.tag_name,
+        executable_asset.size as f64 / (1024.0 * 1024.0));
     let download = tempfile::tempdir().context("creating temporary update directory")?;
     let executable = download.path().join(EXECUTABLE_ASSET);
     let checksum = download.path().join(CHECKSUM_ASSET);
-    download_asset(&client, &release.tag_name, EXECUTABLE_ASSET, &executable, MAX_EXECUTABLE_BYTES)?;
-    download_asset(&client, &release.tag_name, CHECKSUM_ASSET, &checksum, 4096)?;
-    verify_checksum(&executable, &checksum)?;
+    download_asset(&client, &release.tag_name, EXECUTABLE_ASSET, &executable,
+        executable_asset.size, MAX_EXECUTABLE_BYTES)?;
+    download_asset(&client, &release.tag_name, CHECKSUM_ASSET, &checksum,
+        checksum_asset.size, 4096)?;
+    println!("Verifying release SHA-256...");
+    verify_checksum(&executable, &checksum, executable_asset.digest.as_deref())?;
+    println!("Installing Echo {remote_version}...");
     self_replace::self_replace(&executable)
         .context("replacing the Echo executable; ensure its install directory is writable")?;
     println!("Updated Echo from {current_version} to {remote_version}. Start echocli again to use it.");
     Ok(())
 }
 
-fn download_asset(client: &ureq::Agent, tag: &str, name: &str, path: &Path, maximum: u64) -> Result<()> {
+fn download_asset(client: &ureq::Agent, tag: &str, name: &str, path: &Path,
+    expected_size: u64, maximum: u64) -> Result<()> {
+    ensure!(expected_size <= maximum, "release asset {name} exceeds its download limit");
     let url = format!("https://github.com/{REPOSITORY}/releases/download/{tag}/{name}");
     let mut response = client.get(&url)
         .header("User-Agent", "Amity-Echo-Updater")
@@ -92,10 +113,11 @@ fn download_asset(client: &ureq::Agent, tag: &str, name: &str, path: &Path, maxi
     let downloaded = io::copy(&mut reader, &mut output)
         .with_context(|| format!("reading release asset {name}"))?;
     ensure!(downloaded <= maximum, "release asset {name} is too large");
+    ensure!(downloaded == expected_size, "release asset {name} has an unexpected size");
     Ok(())
 }
 
-fn verify_checksum(executable: &std::path::Path, checksum: &std::path::Path) -> Result<()> {
+fn verify_checksum(executable: &Path, checksum: &Path, github_digest: Option<&str>) -> Result<()> {
     let expected = fs::read_to_string(checksum)
         .with_context(|| format!("reading release checksum {}", checksum.display()))?;
     let mut fields = expected.split_whitespace();
@@ -120,5 +142,20 @@ fn verify_checksum(executable: &std::path::Path, checksum: &std::path::Path) -> 
     }
     ensure!(actual_hash.eq_ignore_ascii_case(expected_hash),
         "downloaded Echo executable does not match the release checksum");
+    if let Some(github_digest) = github_digest {
+        ensure!(github_digest.eq_ignore_ascii_case(&format!("sha256:{actual_hash}")),
+            "downloaded Echo executable does not match GitHub's release digest");
+    }
     Ok(())
+}
+
+fn is_source_build() -> Result<bool> {
+    let executable = std::env::current_exe().context("finding the running Echo executable")?;
+    let segments: Vec<String> = executable.components()
+        .map(|segment| segment.as_os_str().to_string_lossy().to_ascii_lowercase())
+        .collect();
+    Ok(segments.windows(2).any(|pair| pair[0] == "target"
+        && matches!(pair[1].as_str(), "debug" | "release"))
+        || segments.windows(3).any(|triple| triple[0] == "target"
+            && matches!(triple[2].as_str(), "debug" | "release")))
 }

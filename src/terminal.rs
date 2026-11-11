@@ -16,6 +16,8 @@ use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlt
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 
+use crate::state::{MessageRole, Session, SessionStatus};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Input {
     Line(String),
@@ -86,6 +88,59 @@ impl Terminal {
             engaged: false,
         }));
         self.draw().context("drawing Echo terminal screen")
+    }
+
+    /// Replace the visible transcript with the selected session's stored conversation.
+    pub fn load_session(&self, session: &Session) {
+        let Some(screen) = &self.screen else { return; };
+        {
+            let mut screen = screen.borrow_mut();
+            screen.project = session.project_id.clone();
+            screen.session = session.id.clone();
+            screen.model = session.model.as_deref().unwrap_or("default").to_owned();
+            screen.lines.clear();
+            screen.scroll = 0;
+            screen.engaged = !session.messages.is_empty();
+            screen.input.clear();
+            screen.cursor = 0;
+            screen.history_position = None;
+            screen.saved_draft.clear();
+            screen.approval = false;
+            screen.status = match &session.status {
+                SessionStatus::Idle => "Ready",
+                SessionStatus::Running => "Task running",
+                SessionStatus::WaitingApproval => "Approval needed",
+                SessionStatus::Interrupted => "Task interrupted",
+                SessionStatus::Completed => "Task complete",
+                SessionStatus::Failed => "Task failed",
+                SessionStatus::Cancelled => "Task cancelled",
+            }.to_owned();
+            for message in &session.messages {
+                match &message.role {
+                    MessageRole::User => Self::append_screen_lines(
+                        &mut screen, &format!("› {}", message.content), Tone::User),
+                    MessageRole::Assistant => {
+                        Self::append_screen_lines(&mut screen, "ECHO", Tone::Brand);
+                        Self::append_screen_lines(&mut screen, &message.content, Tone::Assistant);
+                        Self::append_screen_lines(&mut screen, "", Tone::Muted);
+                    }
+                    MessageRole::Tool => {
+                        Self::append_screen_lines(&mut screen, "TOOL", Tone::Tool);
+                        Self::append_screen_lines(&mut screen, &message.content, Tone::Muted);
+                        Self::append_screen_lines(&mut screen, "", Tone::Muted);
+                    }
+                    MessageRole::System => {
+                        Self::append_screen_lines(&mut screen, "SYSTEM", Tone::Warning);
+                        Self::append_screen_lines(&mut screen, &message.content, Tone::Info);
+                    }
+                }
+            }
+            if screen.lines.len() > 4000 {
+                let excess = screen.lines.len() - 4000;
+                screen.lines.drain(..excess);
+            }
+        }
+        let _ = self.draw();
     }
 
     pub fn read_line(&mut self, project: &str, session: &str) -> Result<Input> {
@@ -236,33 +291,15 @@ impl Terminal {
     }
 
     fn log(&self, message: &str, tone: Tone) {
-        let safe = Self::clean(&crate::state::redact_credentials(message));
         if let Some(screen) = &self.screen {
             let mut screen = screen.borrow_mut();
+            let safe = Self::clean(&crate::state::redact_credentials(message));
             if matches!(tone, Tone::Operation) { screen.status = safe.clone(); }
             if matches!(tone, Tone::Assistant) { screen.status = "Ready".into(); }
             if matches!(tone, Tone::User | Tone::Assistant | Tone::Operation | Tone::Tool | Tone::Code) {
                 screen.engaged = true;
             }
-            let mut in_code = false;
-            for line in safe.split('\n') {
-                let line_tone = if matches!(tone, Tone::Assistant) {
-                    let trimmed = line.trim_start();
-                    if trimmed.starts_with("```") {
-                        in_code = !in_code;
-                        Tone::Muted
-                    } else if in_code {
-                        Tone::Code
-                    } else if trimmed.starts_with("# ") || trimmed.starts_with("## ") || trimmed.starts_with("### ") {
-                        Tone::Brand
-                    } else {
-                        Tone::Assistant
-                    }
-                } else {
-                    tone
-                };
-                screen.lines.push(ScreenLine { text: line.to_owned(), tone: line_tone });
-            }
+            Self::append_screen_lines(&mut screen, &safe, tone);
             if screen.lines.len() > 4000 {
                 let excess = screen.lines.len() - 4000;
                 screen.lines.drain(..excess);
@@ -270,6 +307,32 @@ impl Terminal {
             screen.scroll = 0;
         }
         let _ = self.draw();
+    }
+
+    fn append_screen_lines(screen: &mut Screen, message: &str, tone: Tone) {
+        let safe = Self::clean(&crate::state::redact_credentials(message));
+        let mut in_code = false;
+        for line in safe.split('\n') {
+            let line_tone = if matches!(tone, Tone::Assistant) {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("```") {
+                    in_code = !in_code;
+                    Tone::Muted
+                } else if in_code {
+                    Tone::Code
+                } else if trimmed.starts_with("# ") || trimmed.starts_with("## ") || trimmed.starts_with("### ") {
+                    Tone::Brand
+                } else {
+                    Tone::Assistant
+                }
+            } else {
+                tone
+            };
+            screen.lines.push(ScreenLine { text: line.to_owned(), tone: line_tone });
+            if screen.lines.len() > 5000 {
+                screen.lines.drain(..1000);
+            }
+        }
     }
 
     fn draw(&self) -> Result<()> {
@@ -296,10 +359,11 @@ impl Terminal {
             out.flush()?;
             return Ok(());
         }
-        self.at(&mut out, 0, 0, width, "  ◇  AMITY ECHO", Tone::Brand)?;
+        let brand = format!("  ◇  AMITY ECHO  v{}", env!("CARGO_PKG_VERSION"));
+        self.at(&mut out, 0, 0, width, &brand, Tone::Brand)?;
         let right = format!("{}  ·  {}", screen.project, screen.model);
         let right_width = right.chars().count();
-        if right_width + 22 < width {
+        if right_width + brand.chars().count() + 4 < width {
             self.at(&mut out, (width - right_width - 2) as u16, 0, right_width,
                 &right, Tone::Info)?;
         }
@@ -358,10 +422,13 @@ impl Terminal {
             input_width, &visible, Tone::Assistant)?;
         self.at(&mut out, 0, (footer + 2) as u16, width.saturating_sub(1), &"─".repeat(width.saturating_sub(1)), Tone::Muted)?;
         let hint = if screen.approval { " Enter confirm · Ctrl+C decline" }
-            else { " Enter send  ·  Ctrl+C exit  ·  ↑↓ history  ·  PgUp/PgDn scroll" };
-        self.at(&mut out, 1, (footer + 3) as u16, width.saturating_sub(2), hint, Tone::Muted)?;
-        let status = truncate(&screen.status, width / 3);
-        if width > status.chars().count() + 75 {
+            else if width >= 100 { " Enter send  ·  Ctrl+C exit  ·  ↑↓ history  ·  PgUp/PgDn scroll" }
+            else { " Enter send · Ctrl+C exit · ↑↓ history" };
+        let status_width = (width / 3).min(30);
+        let hint_width = width.saturating_sub(status_width + 3);
+        self.at(&mut out, 1, (footer + 3) as u16, hint_width, hint, Tone::Muted)?;
+        let status = truncate(&screen.status, status_width);
+        if !status.is_empty() {
             self.at(&mut out, (width - status.chars().count() - 2) as u16,
                 (footer + 3) as u16, status.chars().count(), &status, Tone::Info)?;
         }

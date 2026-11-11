@@ -10,7 +10,7 @@ Install the Rust binary from this directory with `cargo install --path . --force
 
 ## Updates
 
-Windows x64 releases are published to the public [Amity Echo GitHub Releases](https://github.com/You-Know-Its-Me-Studios/Amity-Echo/releases) page. Run `echocli update` from any directory, then start `echocli` again to use the new binary. Echo downloads the latest published release over HTTPS and verifies its Windows executable against the release's SHA-256 checksum. No GitHub account or GitHub CLI is needed for version 0.1.2 and later. Echo's local configuration and sessions are separate from the executable.
+Windows x64 releases are published to the public [Amity Echo GitHub Releases](https://github.com/You-Know-Its-Me-Studios/Amity-Echo/releases) page. `echocli --version` shows the installed version, and `echocli update --check` reports the latest version and release link without installing it. Run `echocli update` from any directory to download the latest release, verify its size and SHA-256 checksum, check GitHub's release digest when supplied, then replace the installed executable. Restart `echocli` to use the new version. Development binaries under `target` must be installed through Cargo instead. No GitHub account or GitHub CLI is needed for version 0.1.2 and later. Echo's local configuration and sessions are separate from the executable.
 
 Version 0.1.1 still uses the GitHub CLI for its own update command. To move from 0.1.1 to 0.1.2, use that command with an authenticated `gh`, or reinstall once from this checkout with `cargo install --path . --force`.
 
@@ -45,11 +45,13 @@ echocli task-steps .\task-plan.json
 echocli sessions
 echocli resume
 echocli status
+echocli --version
+echocli update --check
 echocli review
 echocli approve --yes
 ```
 
-Interactive commands include `/task`, `/task-steps`, `/status`, `/review`, `/approve`, `/continue`, `/interrupt`, `/retry`, `/cancel`, `/reconcile`, `/report`, `/raw`, `/tools`, `/session new`, `/resume`, `/project`, `/model`, and `/exit`. `echocli --help` gives the complete command list. Direct instructions are suitable for scripting; proposals remain pending until an explicit approval command. `echocli task` forces the host task workflow when a natural instruction is ambiguous. A `task-steps` file contains Amity's existing `{ "request": "...", "steps": [{ "id": "...", "instruction": "...", "depends_on": [] }] }` task shape.
+Interactive commands include `/task`, `/task-steps`, `/status`, `/review`, `/approve`, `/continue`, `/interrupt`, `/retry`, `/cancel`, `/reconcile`, `/report`, `/raw`, `/tools`, `/session new`, `/resume`, `/project`, `/model`, and `/exit`. Reopening or switching a session restores its stored conversation in the terminal. `echocli --help` gives the complete command list. Direct instructions are suitable for scripting; proposals remain pending until an explicit approval command. `echocli task` forces the host task workflow when a natural instruction is ambiguous. A `task-steps` file contains Amity's existing `{ "request": "...", "steps": [{ "id": "...", "instruction": "...", "depends_on": [] }] }` task shape.
 
 Echo stores configuration and recoverable session JSON under `%LOCALAPPDATA%\Amity\Echo` on Windows, or under the platform home/config directory elsewhere. `AMITY_ECHO_HOME` overrides that location. Session files contain Echo conversation text and links to Amity task IDs; Amity retains authoritative project context, permissions, task transcripts, and evidence. Echo redacts common credential forms before persistence. Avoid placing secrets in development instructions.
 
