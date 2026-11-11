@@ -12,10 +12,10 @@ use config::Config;
 use state::{MessageRole, Session, SessionStore};
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use terminal::{Input, MenuChoice, Terminal};
+use terminal::{Input, MenuChoice, SessionPickerEntry, Terminal};
 
 fn main() {
     if let Err(error) = run() {
@@ -92,8 +92,9 @@ fn run() -> Result<()> {
             let session = if let Some(id) = args.get(1) {
                 store.load(id)?
             } else {
-                let project = active_project(&config)?;
-                store.latest(&project.id)?.context("no previous session for this project")?
+                terminal.enter_interactive(&cwd)?;
+                let Some(session) = browse_session(&config, &store, &mut terminal)? else { return Ok(()); };
+                session
             };
             if config.active_project.as_deref() != Some(&session.project_id) {
                 config.select_project(&session.project_id)?;
@@ -208,7 +209,12 @@ fn active_project(config: &Config) -> Result<&config::ProjectRegistration> {
 
 fn current_session(config: &Config, store: &SessionStore) -> Result<Session> {
     let project = active_project(config)?;
-    if let Some(session) = store.latest(&project.id)? { return Ok(session); }
+    let cwd = env::current_dir()?;
+    let cwd = cwd.canonicalize().unwrap_or(cwd);
+    if let Some(session) = store.list(Some(&project.id))?.into_iter()
+        .find(|session| session_matches_cwd(session, &cwd, &project.path)) {
+        return Ok(session);
+    }
     store.create(&project.id, project.selected_model.clone()).map_err(Into::into)
 }
 
@@ -218,7 +224,7 @@ fn interactive_without_project(config: &mut Config, store: &SessionStore, termin
     loop {
         cancel.store(false, Ordering::Relaxed);
         terminal.set_menu_choices(false, menu_choices(config, None));
-        match terminal.read_line("Local workspace", "new", &mut || session_menu_choices(config, store, None))? {
+        match terminal.read_line("Local workspace", "new")? {
             Input::Eof => return Ok(()),
             Input::Interrupt => return Ok(()),
             Input::Line(line) => {
@@ -227,8 +233,20 @@ fn interactive_without_project(config: &mut Config, store: &SessionStore, termin
                 if line == "/exit" || line == "/quit" { return Ok(()); }
                 if line == "/help" { print_interactive_help(terminal); continue; }
                 if line == "/projects" || line == "/project" { terminal.raw(&projects_text(config)); continue; }
-                if line == "/sessions" || line == "/resume" {
+                if line == "/sessions" {
                     if let Err(error) = list_sessions(store, None, terminal) { terminal.error(&format!("{error:#}")); }
+                    continue;
+                }
+                if line == "/resume" {
+                    match browse_session(config, store, terminal) {
+                        Ok(Some(session)) => {
+                            config.select_project(&session.project_id)?;
+                            config.save()?;
+                            return interactive(config, store, terminal, cancel, session);
+                        }
+                        Ok(None) => {}
+                        Err(error) => terminal.error(&format!("{error:#}")),
+                    }
                     continue;
                 }
                 if line == "/config" { terminal.raw(&config_text(config)?); continue; }
@@ -303,8 +321,7 @@ fn interactive(config: &mut Config, store: &SessionStore, terminal: &mut Termina
     loop {
         cancel.store(false, Ordering::Relaxed);
         terminal.set_menu_choices(true, menu_choices(config, session.model.as_deref()));
-        match terminal.read_line(&session.project_id, &session.id,
-            &mut || session_menu_choices(config, store, Some(&session.project_id)))? {
+        match terminal.read_line(&session.project_id, &session.id)? {
             Input::Eof => return Ok(()),
             Input::Interrupt => return Ok(()),
             Input::Line(line) => {
@@ -312,8 +329,23 @@ fn interactive(config: &mut Config, store: &SessionStore, terminal: &mut Termina
                 if line.is_empty() { continue; }
                 if line == "/exit" || line == "/quit" { return Ok(()); }
                 if line == "/help" { print_interactive_help(terminal); continue; }
-                if line == "/sessions" || line == "/resume" {
+                if line == "/sessions" {
                     if let Err(error) = list_sessions(store, Some(&session.project_id), terminal) { terminal.error(&format!("{error:#}")); }
+                    continue;
+                }
+                if line == "/resume" {
+                    let result = (|| -> Result<()> {
+                        let Some(next) = browse_session(config, store, terminal)? else { return Ok(()); };
+                        if next.project_id != session.project_id {
+                            config.select_project(&next.project_id)?;
+                            config.save()?;
+                        }
+                        session = next;
+                        terminal.context(&session.project_id, &session.id, session.model.as_deref().unwrap_or("default"));
+                        terminal.load_session(&session);
+                        Ok(())
+                    })();
+                    if let Err(error) = result { terminal.error(&format!("{error:#}")); }
                     continue;
                 }
                 if line == "/projects" || line == "/project" { terminal.raw(&projects_text(config)); continue; }
@@ -350,11 +382,9 @@ fn interactive(config: &mut Config, store: &SessionStore, terminal: &mut Termina
                 }
                 if let Some(path) = line.strip_prefix("/project add ") {
                     let result = (|| -> Result<()> {
-                        let id = config.register_host_config(path.trim().trim_matches('"'))?.id.clone();
+                        config.register_host_config(path.trim().trim_matches('"'))?;
                         config.save()?;
-                        let project = active_project(config)?;
-                        session = if let Some(existing) = store.latest(&id)? { existing }
-                            else { store.create(&id, project.selected_model.clone())? };
+                        session = current_session(config, store)?;
                         terminal.context(&session.project_id, &session.id, session.model.as_deref().unwrap_or("default"));
                         terminal.load_session(&session);
                         Ok(())
@@ -364,11 +394,9 @@ fn interactive(config: &mut Config, store: &SessionStore, terminal: &mut Termina
                 }
                 if let Some(id) = line.strip_prefix("/project use ").or_else(|| line.strip_prefix("/project ")) {
                     let result = (|| -> Result<()> {
-                        let id = config.select_project(id.trim())?.id.clone();
+                        config.select_project(id.trim())?;
                         config.save()?;
-                        let project = active_project(config)?;
-                        session = if let Some(existing) = store.latest(&id)? { existing }
-                            else { store.create(&id, project.selected_model.clone())? };
+                        session = current_session(config, store)?;
                         terminal.context(&session.project_id, &session.id, session.model.as_deref().unwrap_or("default"));
                         terminal.load_session(&session);
                         Ok(())
@@ -471,17 +499,51 @@ fn menu_choices(config: &Config, active_model: Option<&str>) -> Vec<MenuChoice> 
     choices
 }
 
-fn session_menu_choices(config: &Config, store: &SessionStore, project_id: Option<&str>) -> Result<Vec<MenuChoice>> {
-    let mut choices = Vec::new();
-    for session in store.list(project_id)? {
-        if !config.projects.iter().any(|project| project.id == session.project_id) { continue; }
-        choices.push(MenuChoice {
-            command: format!("/resume {}", session.id),
-            description: format!("{}  ·  {:?}  ·  {} messages",
-                session.project_id, session.status, session.messages.len()),
+fn browse_session(config: &Config, store: &SessionStore, terminal: &mut Terminal) -> Result<Option<Session>> {
+    let entries = session_picker_entries(config, store)?;
+    match terminal.choose_session(&entries)? {
+        Some(id) => Ok(Some(store.load(&id)?)),
+        None => Ok(None),
+    }
+}
+
+fn session_picker_entries(config: &Config, store: &SessionStore) -> Result<Vec<SessionPickerEntry>> {
+    let cwd = env::current_dir()?;
+    let cwd = cwd.canonicalize().unwrap_or(cwd);
+    let mut entries = Vec::new();
+    for session in store.list(None)? {
+        let Some(project) = config.projects.iter().find(|project| project.id == session.project_id) else { continue; };
+        let directory = session.working_directory.as_deref().unwrap_or(&project.path).to_path_buf();
+        let cwd_match = session_matches_cwd(&session, &cwd, &project.path);
+        let title = session.messages.iter()
+            .find(|message| matches!(&message.role, MessageRole::User))
+            .and_then(|message| message.content.lines().find(|line| !line.trim().is_empty()))
+            .map(|line| line.trim().chars().take(120).collect())
+            .unwrap_or_else(|| "New conversation".to_owned());
+        entries.push(SessionPickerEntry {
+            id: session.id,
+            title,
+            project_name: project.name.clone(),
+            directory,
+            cwd_match,
+            created_at_ms: session.created_at_ms,
+            updated_at_ms: session.updated_at_ms,
+            status: session.status,
         });
     }
-    Ok(choices)
+    Ok(entries)
+}
+
+fn same_directory(left: &Path, right: &Path) -> bool {
+    left == right || cfg!(windows)
+        && left.to_string_lossy().eq_ignore_ascii_case(right.to_string_lossy().as_ref())
+}
+
+fn session_matches_cwd(session: &Session, cwd: &Path, project_root: &Path) -> bool {
+    match session.working_directory.as_deref() {
+        Some(directory) => same_directory(directory, cwd),
+        None => cwd.starts_with(project_root),
+    }
 }
 
 fn list_projects(config: &Config) {
@@ -592,9 +654,14 @@ fn model_command(config: &mut Config, args: &[String]) -> Result<()> {
             let name = if name == "default" { None } else { Some(name.as_str()) };
             config.active_project_mut().context("no active project")?.select_model(name)?;
             config.save()?;
-            let project_id = active_project(config)?.id.clone();
+            let project = active_project(config)?;
+            let project_id = project.id.clone();
+            let project_root = project.path.clone();
             let store = SessionStore::new(config)?;
-            if let Some(mut session) = store.latest(&project_id)? {
+            let cwd = env::current_dir()?;
+            let cwd = cwd.canonicalize().unwrap_or(cwd);
+            if let Some(mut session) = store.list(Some(&project_id))?.into_iter()
+                .find(|session| session_matches_cwd(session, &cwd, &project_root)) {
                 session.model = name.map(str::to_owned);
                 store.save(&session)?;
             }
@@ -615,7 +682,7 @@ echocli                          Interactive agent\n\
 echocli \"instruction\"            Ask or request a coding task\n\
 echocli task \"instruction\"       Force an Amity coding task\n\
 echocli task-steps <plan.json>    Run a structured multistep Amity task\n\
-echocli resume [session-id]      Reopen a session\n\
+echocli resume [session-id]      Browse sessions or reopen one by ID\n\
 echocli sessions                 List project sessions\n\
 echocli status                   Inspect active task\n\
 echocli update                   Install the latest GitHub Release\n\
@@ -638,6 +705,6 @@ AMITY_HOST_CONFIG can register its bound project on first launch.");
 fn print_interactive_help(terminal: &Terminal) {
     terminal.raw("/help  /status  /review  /approve  /continue  /retry  /interrupt  /cancel  /raw\n\
 /tools  /report  /reconcile  /task-steps <plan.json>\n\
-/sessions  /resume <id>  /session new  /projects  /project add <amity-host.json>  /project <id>\n\
+/sessions  /resume  /resume <id>  /session new  /projects  /project add <amity-host.json>  /project <id>\n\
 /models  /model <name|default>  /config host <amity-executable>  /task <instruction>  /exit");
 }

@@ -12,6 +12,8 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 pub struct Session {
     pub id: String,
     pub project_id: String,
+    #[serde(default)]
+    pub working_directory: Option<PathBuf>,
     pub model: Option<String>,
     pub created_at_ms: u128,
     pub updated_at_ms: u128,
@@ -87,8 +89,10 @@ impl SessionStore {
             return Err(invalid("session project ID cannot be empty"));
         }
         let now = now_ms();
+        let cwd = std::env::current_dir()?;
+        let working_directory = Some(cwd.canonicalize().unwrap_or(cwd));
         let session = Session {
-            id: new_id(), project_id: project_id.to_owned(), model,
+            id: new_id(), project_id: project_id.to_owned(), working_directory, model,
             created_at_ms: now, updated_at_ms: now,
             status: SessionStatus::Idle, messages: Vec::new(), task_ids: Vec::new(),
             active_task: None, active_step: None, pending_approval: None,

@@ -7,7 +7,7 @@ use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use crossterm::{execute, queue};
@@ -33,6 +33,46 @@ pub struct MenuChoice {
     pub command: String,
     pub description: String,
 }
+
+pub struct SessionPickerEntry {
+    pub id: String,
+    pub title: String,
+    pub project_name: String,
+    pub directory: PathBuf,
+    pub cwd_match: bool,
+    pub created_at_ms: u128,
+    pub updated_at_ms: u128,
+    pub status: SessionStatus,
+}
+
+// Monochrome terminal render sampled from the supplied Echo logo.
+const ECHO_LOGO_LARGE: &[&str] = &[
+    "         :--::..            ...:::.",
+    "     .-+*+-:                    .:-==-.",
+    "   :*%%#-   .:...           ....   :=**=:",
+    " .+%%%+ .=+*=:                .:==-. -+**=",
+    ".*###= =#%*: :--:.         .:-: .=##= :=+*+.",
+    "=*++=.+#*+.-#%+:::        :::=##-.+#%+ :-=+-",
+    "+=--.:+==::##+-*#*+=====++*#*-+##::++*:.:--=",
+    "=---.:+=-::**=-*#*++====++*#*-=++:.-=+:.::--",
+    "-+=-:.=**=:-*#=:::        :::=#*:.=++= :---:",
+    " =*+=-.=##+: :-:.          .--: :*%#= :==+-",
+    "  -*#*=..-+=-.                .-+*=. =##*-",
+    "   .=**+-   .....           ..:.   =#%%+:",
+    "     .-===-.                   .:=*#*=.",
+    "         .:::...            .::-==:.",
+];
+
+const ECHO_LOGO_SMALL: &[&str] = &[
+    "    .-=-:..          ..::-:.",
+    " .=*#+-:::.           .:::-++-.",
+    ":*#*-=**---.        .:-:=*=:=++:",
+    "+==:=+=:*#=++=----=++=**:+*+.--=",
+    "==-.=+=:+*=++=----=++=*+:=+=.:--",
+    ".=++-=*+---.        .---**=:=+-.",
+    "  -+*=:::..          ..:--*#*-",
+    "    .:-::..          .:-=+=:",
+];
 
 pub struct Terminal {
     editor: Option<DefaultEditor>,
@@ -74,7 +114,6 @@ struct Screen {
     project_connected: bool,
     menu_index: usize,
     menu_dismissed: bool,
-    session_menu_loaded: bool,
     update_version: Option<String>,
 }
 
@@ -110,7 +149,7 @@ impl Terminal {
             cursor: 0, scroll: 0, status: "Ready".into(), approval: false, raw: false,
             history: Vec::new(), history_position: None, saved_draft: String::new(),
             engaged: false, menu_choices: Vec::new(), project_connected: false,
-            menu_index: 0, menu_dismissed: false, session_menu_loaded: false,
+            menu_index: 0, menu_dismissed: false,
             update_version: None,
         }));
         let (sender, receiver) = mpsc::channel();
@@ -128,7 +167,6 @@ impl Terminal {
         screen.project_connected = project_connected;
         screen.menu_choices = choices;
         screen.menu_index = 0;
-        screen.session_menu_loaded = false;
     }
 
     /// Replace the visible transcript with the selected session's stored conversation.
@@ -184,15 +222,14 @@ impl Terminal {
         let _ = self.draw();
     }
 
-    pub fn read_line(&mut self, project: &str, session: &str,
-        session_choices: &mut dyn FnMut() -> Result<Vec<MenuChoice>>) -> Result<Input> {
+    pub fn read_line(&mut self, project: &str, session: &str) -> Result<Input> {
         if self.screen.is_some() {
             {
                 let mut screen = self.screen.as_ref().expect("screen is present").borrow_mut();
                 screen.project = project.to_owned();
                 screen.session = session.to_owned();
             }
-            return self.read_screen_input(true, Some(session_choices));
+            return self.read_screen_input(true);
         }
         let prompt = format!(
             "{} {} {} ",
@@ -203,12 +240,140 @@ impl Terminal {
         self.read_with_prompt(&prompt, true)
     }
 
+    /// Browse saved conversations without changing the active session until one is chosen.
+    pub fn choose_session(&mut self, entries: &[SessionPickerEntry]) -> Result<Option<String>> {
+        if self.screen.is_none() {
+            anyhow::bail!("the session browser needs an interactive terminal; use `echocli resume <session-id>`");
+        }
+        terminal::enable_raw_mode().context("enabling Echo session browser input")?;
+        self.screen.as_ref().expect("screen is present").borrow_mut().raw = true;
+        let result = self.session_picker_loop(entries);
+        let disable = terminal::disable_raw_mode().context("restoring normal terminal input");
+        if disable.is_ok() {
+            self.screen.as_ref().expect("screen is present").borrow_mut().raw = false;
+        }
+        let redraw = self.draw();
+        disable?;
+        redraw?;
+        result
+    }
+
+    fn session_picker_loop(&self, entries: &[SessionPickerEntry]) -> Result<Option<String>> {
+        let mut query = String::new();
+        let mut cwd_only = true;
+        let mut status_filter = 0u8;
+        let mut sort_created = false;
+        let mut selected = 0usize;
+        loop {
+            let visible = session_picker_rows(entries, &query, cwd_only, status_filter, sort_created);
+            selected = selected.min(visible.len().saturating_sub(1));
+            self.draw_session_picker(&visible, &query, cwd_only, status_filter, sort_created, selected)?;
+            let list_visible = terminal::size().is_ok_and(|(width, height)| width >= 24 && height >= 8);
+            match event::read().context("reading Echo session browser input")? {
+                Event::Resize(_, _) => {}
+                Event::Key(key) if key.kind != KeyEventKind::Release => match key.code {
+                    KeyCode::Esc => return Ok(None),
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return Ok(None),
+                    KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => return Ok(None),
+                    KeyCode::Enter if list_visible && !visible.is_empty() => return Ok(Some(visible[selected].id.clone())),
+                    KeyCode::Up if !visible.is_empty() => selected = selected.saturating_sub(1),
+                    KeyCode::Down if !visible.is_empty() => selected = (selected + 1).min(visible.len() - 1),
+                    KeyCode::PageUp if !visible.is_empty() => selected = selected.saturating_sub(10),
+                    KeyCode::PageDown if !visible.is_empty() => selected = (selected + 10).min(visible.len() - 1),
+                    KeyCode::Tab => { cwd_only = !cwd_only; selected = 0; }
+                    KeyCode::F(2) => { sort_created = !sort_created; selected = 0; }
+                    KeyCode::F(3) => { status_filter = (status_filter + 1) % 3; selected = 0; }
+                    KeyCode::Backspace => { query.pop(); selected = 0; }
+                    KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) && query.len() < 256 => {
+                        query.push(ch);
+                        selected = 0;
+                    }
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+    }
+
+    fn draw_session_picker(&self, visible: &[&SessionPickerEntry], query: &str,
+        cwd_only: bool, status_filter: u8, sort_created: bool, selected: usize) -> Result<()> {
+        let (width, height) = terminal::size().context("reading terminal size")?;
+        let width = usize::from(width);
+        let height = usize::from(height);
+        if width == 0 || height == 0 { return Ok(()); }
+        let mut out = io::stdout();
+        queue!(out, MoveTo(0, 0), Clear(ClearType::All))?;
+        if height < 8 || width < 24 {
+            self.at(&mut out, 0, 0, width, " AMITY ECHO  /  RESUME", Tone::Brand)?;
+            if height > 1 { self.at(&mut out, 0, 1, width, " Enlarge the terminal to browse sessions.", Tone::Warning)?; }
+            out.flush()?;
+            return Ok(());
+        }
+        self.at(&mut out, 1, 0, width.saturating_sub(2), "AMITY ECHO  /  RESUME", Tone::Brand)?;
+        if let Some(screen) = &self.screen {
+            self.at(&mut out, 1, 1, width.saturating_sub(2),
+                &format!("Directory: {}", screen.borrow().cwd.display()), Tone::Muted)?;
+        }
+        let scope = if cwd_only { "[CWD] All" } else { "CWD [All]" };
+        let status = match status_filter {
+            1 => "All [Active] Finished",
+            2 => "All Active [Finished]",
+            _ => "[All] Active Finished",
+        };
+        let sort = if sort_created { "Updated [Created]" } else { "[Updated] Created" };
+        self.at(&mut out, 1, 2, width.saturating_sub(2),
+            &format!("Scope: {scope}   Status: {status}   Sort: {sort}"), Tone::Info)?;
+        self.at(&mut out, 1, 3, width.saturating_sub(2),
+            &format!("Search: {query}"), Tone::Assistant)?;
+        self.at(&mut out, 0, 4, width.saturating_sub(1),
+            &"─".repeat(width.saturating_sub(1)), Tone::Muted)?;
+        let rows = height.saturating_sub(7);
+        if visible.is_empty() {
+            let message = if cwd_only {
+                "No matching sessions in this directory. Press Tab to browse all."
+            } else { "No matching sessions." };
+            self.at(&mut out, 2, 5, width.saturating_sub(4), message, Tone::Muted)?;
+        } else {
+            let first = selected.saturating_sub(rows.saturating_sub(1))
+                .min(visible.len().saturating_sub(rows));
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis();
+            for (offset, entry) in visible[first..(first + rows).min(visible.len())].iter().enumerate() {
+                let y = 5 + offset;
+                let active = first + offset == selected;
+                let age = relative_age(now.saturating_sub(entry.updated_at_ms));
+                let title = if cwd_only { entry.title.clone() } else {
+                    let folder = entry.directory.file_name()
+                        .map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+                    format!("{}  ·  {} / {}", entry.title, entry.project_name, folder)
+                };
+                let label = format!("{} {:>8}  {:<10}  {}", if active { "›" } else { " " },
+                    age, session_status_label(&entry.status), title);
+                let row_width = width.saturating_sub(2);
+                let label = truncate(&Self::clean(&label), row_width);
+                queue!(out, MoveTo(0, y as u16), Clear(ClearType::CurrentLine), MoveTo(1, y as u16))?;
+                if self.color && active {
+                    queue!(out, SetBackgroundColor(Color::DarkCyan), SetForegroundColor(Color::White),
+                        Print(&label), Print(" ".repeat(row_width.saturating_sub(label.chars().count()))), ResetColor)?;
+                } else {
+                    if self.color { queue!(out, SetForegroundColor(if active { Color::White } else { Color::Grey }))?; }
+                    queue!(out, Print(&label), ResetColor)?;
+                }
+            }
+        }
+        self.at(&mut out, 0, (height - 2) as u16, width.saturating_sub(1),
+            &"─".repeat(width.saturating_sub(1)), Tone::Muted)?;
+        self.at(&mut out, 1, (height - 1) as u16, width.saturating_sub(2),
+            &format!("{} sessions · ↑↓ choose · Enter open · Tab scope · F2 sort · F3 status · Esc back", visible.len()),
+            Tone::Muted)?;
+        out.flush().context("drawing Echo session browser")
+    }
+
     pub fn ask_approval(&mut self, description: &str) -> Result<bool> {
         if self.screen.is_some() {
             self.log(description, Tone::Warning);
             self.screen.as_ref().expect("screen is present").borrow_mut().approval = true;
             loop {
-                match self.read_screen_input(false, None)? {
+                match self.read_screen_input(false)? {
                     Input::Line(answer) => match answer.trim().to_ascii_lowercase().as_str() {
                         "y" | "yes" => { self.screen.as_ref().expect("screen is present").borrow_mut().approval = false; return Ok(true); }
                         "" | "n" | "no" => { self.screen.as_ref().expect("screen is present").borrow_mut().approval = false; return Ok(false); }
@@ -232,11 +397,10 @@ impl Terminal {
         }
     }
 
-    fn read_screen_input(&mut self, record_input: bool,
-        session_choices: Option<&mut dyn FnMut() -> Result<Vec<MenuChoice>>>) -> Result<Input> {
+    fn read_screen_input(&mut self, record_input: bool) -> Result<Input> {
         terminal::enable_raw_mode().context("enabling Echo keyboard input")?;
         self.screen.as_ref().expect("screen is present").borrow_mut().raw = true;
-        let result = self.screen_input_loop(record_input, session_choices);
+        let result = self.screen_input_loop(record_input);
         let disable = terminal::disable_raw_mode().context("restoring normal terminal input");
         if disable.is_ok() {
             self.screen.as_ref().expect("screen is present").borrow_mut().raw = false;
@@ -294,7 +458,7 @@ impl Terminal {
         let root: &[(&str, &str, bool, bool)] = &[
             ("/model", "Choose a configured model", false, true),
             ("/project", "Choose or connect a project", false, false),
-            ("/resume", "Open a saved conversation", false, false),
+            ("/resume", "Browse saved conversations", true, false),
             ("/session new", "Start a new conversation", true, true),
             ("/status", "Inspect the active Amity task", true, false),
             ("/review", "Review a pending proposal", true, true),
@@ -328,8 +492,7 @@ impl Terminal {
         }).collect()
     }
 
-    fn screen_input_loop(&mut self, record_input: bool,
-        mut session_choices: Option<&mut dyn FnMut() -> Result<Vec<MenuChoice>>>) -> Result<Input> {
+    fn screen_input_loop(&mut self, record_input: bool) -> Result<Input> {
         self.refresh_update_notice();
         self.draw()?;
         loop {
@@ -344,7 +507,6 @@ impl Terminal {
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
                     let mut submitted = None;
                     let mut finished = None;
-                    let mut load_sessions = false;
                     {
                         let mut screen = self.screen.as_ref().expect("screen is present").borrow_mut();
                         let before_input = screen.input.clone();
@@ -379,7 +541,7 @@ impl Terminal {
                                     if record_input && !line.trim().is_empty() {
                                         screen.history.push(line.clone());
                                         if screen.history.len() > 100 { screen.history.remove(0); }
-                                        submitted = Some(line.clone());
+                                        if line.trim() != "/resume" { submitted = Some(line.clone()); }
                                     }
                                     finished = Some(Input::Line(line));
                                 }
@@ -456,20 +618,6 @@ impl Terminal {
                         if screen.input != before_input {
                             screen.menu_index = 0;
                             screen.menu_dismissed = navigated_history;
-                        }
-                        if !screen.session_menu_loaded && !screen.approval
-                            && screen.input.starts_with("/resume") && session_choices.is_some() {
-                            screen.session_menu_loaded = true;
-                            load_sessions = true;
-                        }
-                    }
-                    if load_sessions {
-                        if let Some(loader) = session_choices.as_deref_mut() {
-                            match loader() {
-                                Ok(choices) => self.screen.as_ref().expect("screen is present")
-                                    .borrow_mut().menu_choices.extend(choices),
-                                Err(error) => self.warning(&format!("Saved session choices unavailable: {error:#}")),
-                            }
                         }
                     }
                     if let Some(line) = submitted { self.log(&format!("› {line}"), Tone::User); }
@@ -573,7 +721,7 @@ impl Terminal {
             out.flush()?;
             return Ok(());
         }
-        let brand = format!("  ◇  AMITY ECHO  v{}", env!("CARGO_PKG_VERSION"));
+        let brand = format!("  AMITY ECHO  v{}", env!("CARGO_PKG_VERSION"));
         if let Some(version) = &screen.update_version {
             let full = format!("Update v{version} available · echocli update");
             let command = "echocli update";
@@ -613,20 +761,31 @@ impl Terminal {
             }
         }
         if !screen.engaged {
-            let logo = [
-                ("◇", Tone::Brand),
-                ("A M I T Y   E C H O", Tone::Brand),
-                ("First-party engineering agent", Tone::Muted),
-                ("Describe a task or ask about your workspace", Tone::Info),
-                ("Type / for commands   ·   Ctrl+C to exit", Tone::Muted),
-            ];
-            let start = content_top + content_height.saturating_sub(logo.len()) / 2;
-            for (offset, (text, tone)) in logo.iter().enumerate() {
-                if start + offset >= footer { break; }
-                let length = text.chars().count();
-                let x = width.saturating_sub(length) / 2;
-                self.at(&mut out, x as u16, (start + offset) as u16,
-                    width.saturating_sub(x), text, *tone)?;
+            let (art, art_width): (&[&str], usize) = if width >= 48 && content_height >= 16 {
+                (ECHO_LOGO_LARGE, 44)
+            } else if width >= 34 && content_height >= 10 {
+                (ECHO_LOGO_SMALL, 32)
+            } else { (&[], 0) };
+            let labels: &[(&str, Tone)] = if content_height >= art.len() + 3 {
+                &[("A M I T Y   E C H O", Tone::Brand),
+                    ("Describe a task or ask about your workspace", Tone::Info),
+                    ("Type / for commands   ·   Ctrl+C to exit", Tone::Muted)]
+            } else if content_height >= art.len() + 2 {
+                &[("A M I T Y   E C H O", Tone::Brand),
+                    ("Type / for commands   ·   Ctrl+C to exit", Tone::Muted)]
+            } else { &[("A M I T Y   E C H O", Tone::Brand)] };
+            let start = content_top + content_height.saturating_sub(art.len() + labels.len()) / 2;
+            let art_x = width.saturating_sub(art_width) / 2;
+            for (offset, line) in art.iter().enumerate() {
+                self.at(&mut out, art_x as u16, (start + offset) as u16,
+                    art_width, line, Tone::Assistant)?;
+            }
+            for (offset, (line, tone)) in labels.iter().enumerate() {
+                let y = start + art.len() + offset;
+                if y >= footer { break; }
+                let x = width.saturating_sub(line.chars().count()) / 2;
+                self.at(&mut out, x as u16, y as u16,
+                    width.saturating_sub(x), line, *tone)?;
             }
         }
         if !rows.is_empty() {
@@ -1013,6 +1172,48 @@ impl Tone {
 
 fn truncate(text: &str, width: usize) -> String {
     text.chars().take(width).collect()
+}
+
+fn session_picker_rows<'a>(entries: &'a [SessionPickerEntry], query: &str,
+    cwd_only: bool, status_filter: u8, sort_created: bool) -> Vec<&'a SessionPickerEntry> {
+    let query = query.to_lowercase();
+    let mut rows: Vec<_> = entries.iter().filter(|entry| {
+        if cwd_only && !entry.cwd_match { return false; }
+        let active = matches!(&entry.status, SessionStatus::Idle | SessionStatus::Running
+            | SessionStatus::WaitingApproval | SessionStatus::Interrupted);
+        if (status_filter == 1 && !active) || (status_filter == 2 && active) { return false; }
+        query.is_empty() || entry.title.to_lowercase().contains(query.as_str())
+            || entry.project_name.to_lowercase().contains(query.as_str())
+            || entry.id.to_lowercase().contains(query.as_str())
+            || entry.directory.to_string_lossy().to_lowercase().contains(query.as_str())
+    }).collect();
+    rows.sort_by(|left, right| {
+        let left_time = if sort_created { left.created_at_ms } else { left.updated_at_ms };
+        let right_time = if sort_created { right.created_at_ms } else { right.updated_at_ms };
+        right_time.cmp(&left_time).then_with(|| right.id.cmp(&left.id))
+    });
+    rows
+}
+
+fn session_status_label(status: &SessionStatus) -> &'static str {
+    match status {
+        SessionStatus::Idle => "ready",
+        SessionStatus::Running => "running",
+        SessionStatus::WaitingApproval => "approval",
+        SessionStatus::Interrupted => "paused",
+        SessionStatus::Completed => "complete",
+        SessionStatus::Failed => "failed",
+        SessionStatus::Cancelled => "cancelled",
+    }
+}
+
+fn relative_age(elapsed_ms: u128) -> String {
+    let minutes = elapsed_ms / 60_000;
+    if minutes == 0 { "now".into() }
+    else if minutes < 60 { format!("{minutes}m ago") }
+    else if minutes < 1_440 { format!("{}h ago", minutes / 60) }
+    else if minutes < 525_600 { format!("{}d ago", minutes / 1_440) }
+    else { format!("{}y ago", minutes / 525_600) }
 }
 
 fn wrap(text: &str, width: usize) -> Vec<String> {
