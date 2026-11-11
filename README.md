@@ -6,15 +6,17 @@ Amity Echo is a local Rust coding agent launched as `echocli`. It keeps its own 
 
 Echo needs an initialized Amity project, its existing host JSON configuration, an `amity` host executable, and `AMITY_HOST_TOKEN` in the calling environment. The token is passed to the host process and is not saved in Echo configuration. The selected Amity host config must contain a configured `model_command`, `model_version`, and authorized `model_actor_id` for agent work. The model command follows Amity's `ModelInput` JSON on stdin and `ModelTurn` JSON on stdout contract. Echo does not provide an inference runtime or provision model membership.
 
-Install the Rust binary from this directory with `cargo install --path .`; this creates the `echocli` command. The installation command is documentation only and was not run as part of this implementation.
+Install the Rust binary from this directory with `cargo install --path .`; this creates the `echocli` command.
+
+`echocli` opens the terminal from any directory, including before a project is connected. The setup prompt accepts `/project add <amity-host.json>` and `/config host <amity-executable>`. Project instructions need a connected, authorized Amity project and a configured model.
 
 ```powershell
 echocli config host "C:\path\to\amity.exe"
-echocli project add "C:\path\to\project" "C:\path\to\amity-host.json"
+echocli project add "C:\path\to\amity-host.json"
 echocli
 ```
 
-Set `AMITY_HOST_CONFIG` to an existing host JSON to register the current directory on first launch. Project selection later follows the current working directory when it is inside a registered project. `echocli project use <id>` switches explicitly.
+Set `AMITY_HOST_CONFIG` to an existing host JSON to register its bound project on first launch. Project selection later follows the current working directory when it is inside a registered project; elsewhere Echo retains the selected project and displays the working directory. `echocli project use <id>` switches explicitly.
 
 Model profiles point at other preconfigured Amity host JSON files for the same authorized project root and ID:
 

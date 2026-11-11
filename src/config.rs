@@ -217,6 +217,14 @@ impl Config {
         self.active_project = Some(id.clone());
         Ok(self.projects.iter().find(|project| project.id == id).expect("registered project exists"))
     }
+
+    /// Register the project already bound by an existing Amity host config.
+    /// The host, rather than Echo's current working directory, supplies the root.
+    pub fn register_host_config(&mut self, host_config: impl AsRef<Path>) -> io::Result<&ProjectRegistration> {
+        let host_config = host_config.as_ref().canonicalize()?;
+        let binding = read_host_binding(&host_config)?;
+        self.register_project(binding.project_root, host_config)
+    }
 }
 
 fn canonical_dir(path: &Path) -> io::Result<PathBuf> {

@@ -26,10 +26,13 @@ fn main() {
 fn run() -> Result<()> {
     let mut config = Config::load().context("loading Echo configuration")?;
     let cwd = env::current_dir().context("reading current directory")?;
+    let mut auto_registration_error = None;
     if config.projects.is_empty() {
         if let Some(host_config) = env::var_os("AMITY_HOST_CONFIG") {
-            config.register_project(&cwd, PathBuf::from(host_config))?;
-            config.save()?;
+            match config.register_host_config(PathBuf::from(host_config)) {
+                Ok(_) => config.save()?,
+                Err(error) => auto_registration_error = Some(error.to_string()),
+            }
         }
     }
     if let Some(project) = config.discover_project(&cwd) {
@@ -59,10 +62,18 @@ fn run() -> Result<()> {
         .context("installing Ctrl+C handler")?;
     let history_path = Config::home_dir().join("history.txt");
     let mut terminal = Terminal::new(history_path, config.terminal.color)?;
+    if let Some(error) = auto_registration_error {
+        terminal.warning(&format!("AMITY_HOST_CONFIG could not register a project: {error}"));
+    }
     match args.first().map(String::as_str) {
         None => {
-            let session = current_session(&config, &store)?;
-            interactive(&mut config, &store, &mut terminal, cancel.as_ref(), session)
+            if config.active_project().is_some() {
+                let session = current_session(&config, &store)?;
+                terminal.info(&format!("Working directory: {}", cwd.display()));
+                interactive(&mut config, &store, &mut terminal, cancel.as_ref(), session)
+            } else {
+                interactive_without_project(&mut config, &store, &mut terminal, cancel.as_ref(), &cwd)
+            }
         }
         Some("resume") => {
             let session = if let Some(id) = args.get(1) {
@@ -71,6 +82,10 @@ fn run() -> Result<()> {
                 let project = active_project(&config)?;
                 store.latest(&project.id)?.context("no previous session for this project")?
             };
+            if config.active_project.as_deref() != Some(&session.project_id) {
+                config.select_project(&session.project_id)?;
+                config.save()?;
+            }
             interactive(&mut config, &store, &mut terminal, cancel.as_ref(), session)
         }
         Some("sessions") => list_sessions(&store, config.active_project.as_deref(), &terminal),
@@ -183,6 +198,76 @@ fn current_session(config: &Config, store: &SessionStore) -> Result<Session> {
     store.create(&project.id, project.selected_model.clone()).map_err(Into::into)
 }
 
+fn interactive_without_project(config: &mut Config, store: &SessionStore, terminal: &mut Terminal,
+    cancel: &AtomicBool, cwd: &std::path::Path) -> Result<()> {
+    terminal.banner("no project", "setup", "unconfigured");
+    terminal.info(&format!("Working directory: {}", cwd.display()));
+    terminal.info("Use /project add <amity-host.json> to connect an existing Amity project, or /project use <id>.");
+    loop {
+        cancel.store(false, Ordering::Relaxed);
+        match terminal.read_line("no project", "setup")? {
+            Input::Eof => return Ok(()),
+            Input::Interrupt => { cancel.store(false, Ordering::Relaxed); terminal.info("Input interrupted."); }
+            Input::Line(line) => {
+                let line = line.trim();
+                if line.is_empty() { continue; }
+                if line == "/exit" || line == "/quit" { return Ok(()); }
+                if line == "/help" { print_interactive_help(); continue; }
+                if line == "/projects" { list_projects(config); continue; }
+                if line == "/sessions" { list_sessions(store, None, terminal)?; continue; }
+                if line == "/config" { show_config(config)?; continue; }
+                if let Some(id) = line.strip_prefix("/resume ") {
+                    let result = store.load(id.trim()).map_err(anyhow::Error::from)
+                        .and_then(|session| {
+                            config.select_project(&session.project_id)?;
+                            config.save()?;
+                            Ok(session)
+                        });
+                    match result {
+                        Ok(session) => return interactive(config, store, terminal, cancel, session),
+                        Err(error) => terminal.error(&format!("{error:#}")),
+                    }
+                    continue;
+                }
+                if let Some(path) = line.strip_prefix("/config host ") {
+                    config.host_executable = PathBuf::from(path.trim().trim_matches('"'));
+                    if let Err(error) = config.save() { terminal.error(&error.to_string()); }
+                    else { terminal.info(&format!("Amity host: {}", config.host_executable.display())); }
+                    continue;
+                }
+                if let Some(path) = line.strip_prefix("/project add ") {
+                    let result = config.register_host_config(path.trim().trim_matches('"'))
+                        .map(|project| project.id.clone()).map_err(anyhow::Error::from)
+                        .and_then(|id| { config.save()?; Ok(id) });
+                    match result {
+                        Ok(id) => {
+                            let session = current_session(config, store)?;
+                            terminal.info(&format!("Connected Amity project {id}"));
+                            return interactive(config, store, terminal, cancel, session);
+                        }
+                        Err(error) => terminal.error(&format!("{error:#}")),
+                    }
+                    continue;
+                }
+                if let Some(id) = line.strip_prefix("/project use ").or_else(|| line.strip_prefix("/project ")) {
+                    let result = config.select_project(id.trim()).map(|project| project.id.clone())
+                        .map_err(anyhow::Error::from).and_then(|id| { config.save()?; Ok(id) });
+                    match result {
+                        Ok(id) => {
+                            let session = current_session(config, store)?;
+                            terminal.info(&format!("Selected Amity project {id}"));
+                            return interactive(config, store, terminal, cancel, session);
+                        }
+                        Err(error) => terminal.error(&format!("{error:#}")),
+                    }
+                    continue;
+                }
+                terminal.warning("Connect an authorized Amity project before sending instructions. Use /project add <amity-host.json>.");
+            }
+        }
+    }
+}
+
 fn interactive(config: &mut Config, store: &SessionStore, terminal: &mut Terminal,
     cancel: &AtomicBool, mut session: Session) -> Result<()> {
     if !config.projects.iter().any(|project| project.id == session.project_id) {
@@ -206,6 +291,12 @@ fn interactive(config: &mut Config, store: &SessionStore, terminal: &mut Termina
                 if line == "/projects" { list_projects(config); continue; }
                 if line == "/models" { list_models(config); continue; }
                 if line == "/config" { show_config(config)?; continue; }
+                if let Some(path) = line.strip_prefix("/config host ") {
+                    config.host_executable = PathBuf::from(path.trim().trim_matches('"'));
+                    if let Err(error) = config.save() { terminal.error(&error.to_string()); }
+                    else { terminal.info(&format!("Amity host: {}", config.host_executable.display())); }
+                    continue;
+                }
                 if let Some(id) = line.strip_prefix("/resume ") {
                     let result = (|| -> Result<()> {
                         let next = store.load(id.trim())?;
@@ -227,7 +318,20 @@ fn interactive(config: &mut Config, store: &SessionStore, terminal: &mut Termina
                     if let Err(error) = result { terminal.error(&format!("{error:#}")); }
                     continue;
                 }
-                if let Some(id) = line.strip_prefix("/project ") {
+                if let Some(path) = line.strip_prefix("/project add ") {
+                    let result = (|| -> Result<()> {
+                        let id = config.register_host_config(path.trim().trim_matches('"'))?.id.clone();
+                        config.save()?;
+                        let project = active_project(config)?;
+                        session = if let Some(existing) = store.latest(&id)? { existing }
+                            else { store.create(&id, project.selected_model.clone())? };
+                        terminal.context(&session.project_id, &session.id, session.model.as_deref().unwrap_or("default"));
+                        Ok(())
+                    })();
+                    if let Err(error) = result { terminal.error(&format!("{error:#}")); }
+                    continue;
+                }
+                if let Some(id) = line.strip_prefix("/project use ").or_else(|| line.strip_prefix("/project ")) {
                     let result = (|| -> Result<()> {
                         let id = config.select_project(id.trim())?.id.clone();
                         config.save()?;
@@ -361,6 +465,12 @@ fn project_command(config: &mut Config, args: &[String]) -> Result<()> {
     match args {
         [] => { list_projects(config); Ok(()) }
         [list] if list == "list" => { list_projects(config); Ok(()) }
+        [action, host_config] if action == "add" => {
+            let id = config.register_host_config(host_config)?.id.clone();
+            config.save()?;
+            println!("Registered project {id}");
+            Ok(())
+        }
         [action, path, host_config] if action == "add" => {
             let id = config.register_project(path, host_config)?.id.clone();
             config.save()?;
@@ -373,7 +483,7 @@ fn project_command(config: &mut Config, args: &[String]) -> Result<()> {
             println!("Selected project {id}");
             Ok(())
         }
-        _ => bail!("usage: echocli project [list | add <directory> <amity-host.json> | use <id>]"),
+        _ => bail!("usage: echocli project [list | add <amity-host.json> | add <directory> <amity-host.json> | use <id>]"),
     }
 }
 
@@ -422,18 +532,19 @@ echocli review                   Show pending gateway proposal\n\
 echocli approve --yes            Explicitly approve and execute pending proposal\n\
 echocli continue | interrupt | cancel | raw  Manage or inspect active task\n\
 echocli tools | report | reconcile Inspect host capabilities and evidence\n\
+echocli project add <amity-host.json>  Register its bound project\n\
 echocli project add <path> <amity-host.json>\n\
 echocli project use <id> | project list\n\
 echocli model add <name> <amity-host.json>\n\
 echocli model use <name|default> | model list\n\
 echocli config [host <path> | timeout <seconds> | color <on|off> | ask-before-execution <on|off>]\n\
 AMITY_HOST_TOKEN is read from the environment and never stored by Echo.\n\
-AMITY_HOST_CONFIG can register the current directory on first launch.");
+AMITY_HOST_CONFIG can register its bound project on first launch.");
 }
 
 fn print_interactive_help() {
     println!("/help  /status  /review  /approve  /continue  /retry  /interrupt  /cancel  /raw\n\
 /tools  /report  /reconcile  /task-steps <plan.json>\n\
-/sessions  /resume <id>  /session new  /projects  /project <id>\n\
-/models  /model <name|default>  /config  /task <instruction>  /exit");
+/sessions  /resume <id>  /session new  /projects  /project add <amity-host.json>  /project <id>\n\
+/models  /model <name|default>  /config host <amity-executable>  /task <instruction>  /exit");
 }
