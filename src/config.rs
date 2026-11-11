@@ -48,7 +48,7 @@ impl ProjectRegistration {
             Some(name) => self.models.iter().find(|model| model.name == name)
                 .map(|model| model.host_config.as_path())
                 .ok_or_else(|| invalid(format!("model profile '{name}' is not configured for {}", self.name))),
-            None => Ok(&self.host_config),
+            None => Ok(self.host_config.as_path()),
         }?;
         canonical_host_config(path, &self.id, &self.path)?;
         Ok(path)

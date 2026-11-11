@@ -164,15 +164,15 @@ impl Agent<'_> {
                 ModelTurn::AipRequest { request } => {
                     let aip_request: Value = serde_json::from_str(&request).context("model returned invalid AIP JSON")?;
                     let kind = aip_request.pointer("/request/type").and_then(Value::as_str)
-                        .context("model AIP request has no type")?;
-                    if !matches!(kind, "capabilities" | "status" | "query_decisions" | "check_names" | "preview"
+                        .context("model AIP request has no type")?.to_owned();
+                    if !matches!(kind.as_str(), "capabilities" | "status" | "query_decisions" | "check_names" | "preview"
                         | "get_context" | "query_impact" | "query_source" | "get_receipt" | "get_completion"
                         | "get_proposal") {
                         bail!("model requested '{kind}' outside the read-only conversational boundary");
                     }
                     self.terminal.operation(&format!("Amity AIP · {kind}"));
                     let reply = model_host.aip(aip_request)?;
-                    if self.config.terminal.show_tool_details { self.terminal.tool_result(kind, &reply.to_string(), true); }
+                    if self.config.terminal.show_tool_details { self.terminal.tool_result(&kind, &reply.to_string(), true); }
                     turns.push(json!({"attempt":1,"request":request,"reply":reply.to_string()}));
                 }
             }
