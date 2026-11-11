@@ -15,7 +15,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use terminal::{Input, Terminal};
+use terminal::{Input, MenuChoice, Terminal};
 
 fn main() {
     if let Err(error) = run() {
@@ -217,7 +217,8 @@ fn interactive_without_project(config: &mut Config, store: &SessionStore, termin
     terminal.banner("Local workspace", "new", "not connected");
     loop {
         cancel.store(false, Ordering::Relaxed);
-        match terminal.read_line("Local workspace", "new")? {
+        terminal.set_menu_choices(false, menu_choices(config, None));
+        match terminal.read_line("Local workspace", "new", &mut || session_menu_choices(config, store, None))? {
             Input::Eof => return Ok(()),
             Input::Interrupt => return Ok(()),
             Input::Line(line) => {
@@ -225,11 +226,14 @@ fn interactive_without_project(config: &mut Config, store: &SessionStore, termin
                 if line.is_empty() { continue; }
                 if line == "/exit" || line == "/quit" { return Ok(()); }
                 if line == "/help" { print_interactive_help(terminal); continue; }
-                if line == "/projects" { terminal.raw(&projects_text(config)); continue; }
-                if line == "/sessions" { list_sessions(store, None, terminal)?; continue; }
+                if line == "/projects" || line == "/project" { terminal.raw(&projects_text(config)); continue; }
+                if line == "/sessions" || line == "/resume" {
+                    if let Err(error) = list_sessions(store, None, terminal) { terminal.error(&format!("{error:#}")); }
+                    continue;
+                }
                 if line == "/config" { terminal.raw(&config_text(config)?); continue; }
                 if line == "/status" { terminal.info("Amity is not connected to this workspace."); continue; }
-                if line == "/models" { terminal.info("Connect an Amity project to see its model profiles."); continue; }
+                if line == "/models" || line == "/model" { terminal.info("Connect an Amity project to see its model profiles."); continue; }
                 if let Some(id) = line.strip_prefix("/resume ") {
                     let result = store.load(id.trim()).map_err(anyhow::Error::from)
                         .and_then(|session| {
@@ -298,7 +302,9 @@ fn interactive(config: &mut Config, store: &SessionStore, terminal: &mut Termina
     }
     loop {
         cancel.store(false, Ordering::Relaxed);
-        match terminal.read_line(&session.project_id, &session.id)? {
+        terminal.set_menu_choices(true, menu_choices(config, session.model.as_deref()));
+        match terminal.read_line(&session.project_id, &session.id,
+            &mut || session_menu_choices(config, store, Some(&session.project_id)))? {
             Input::Eof => return Ok(()),
             Input::Interrupt => return Ok(()),
             Input::Line(line) => {
@@ -306,9 +312,12 @@ fn interactive(config: &mut Config, store: &SessionStore, terminal: &mut Termina
                 if line.is_empty() { continue; }
                 if line == "/exit" || line == "/quit" { return Ok(()); }
                 if line == "/help" { print_interactive_help(terminal); continue; }
-                if line == "/sessions" { list_sessions(store, Some(&session.project_id), terminal)?; continue; }
-                if line == "/projects" { terminal.raw(&projects_text(config)); continue; }
-                if line == "/models" { terminal.raw(&models_text(config)); continue; }
+                if line == "/sessions" || line == "/resume" {
+                    if let Err(error) = list_sessions(store, Some(&session.project_id), terminal) { terminal.error(&format!("{error:#}")); }
+                    continue;
+                }
+                if line == "/projects" || line == "/project" { terminal.raw(&projects_text(config)); continue; }
+                if line == "/models" || line == "/model" { terminal.raw(&models_text(config)); continue; }
                 if line == "/config" { terminal.raw(&config_text(config)?); continue; }
                 if let Some(path) = line.strip_prefix("/config host ") {
                     config.host_executable = PathBuf::from(path.trim().trim_matches('"'));
@@ -432,6 +441,47 @@ fn list_sessions(store: &SessionStore, project_id: Option<&str>, terminal: &Term
             session.active_task.as_deref().unwrap_or("—"), session.messages.len()));
     }
     Ok(())
+}
+
+fn menu_choices(config: &Config, active_model: Option<&str>) -> Vec<MenuChoice> {
+    let mut choices = Vec::new();
+    if let Some(project) = config.active_project() {
+        choices.push(MenuChoice {
+            command: "/model default".into(),
+            description: if active_model.is_none() { "Current model profile".into() }
+                else { "Use the project's default model profile".into() },
+        });
+        for model in &project.models {
+            choices.push(MenuChoice {
+                command: format!("/model {}", model.name),
+                description: if active_model == Some(model.name.as_str()) {
+                    "Current model profile".into()
+                } else {
+                    format!("Use {} for this project", model.name)
+                },
+            });
+        }
+    }
+    for project in &config.projects {
+        choices.push(MenuChoice {
+            command: format!("/project use {}", project.id),
+            description: format!("{}  ·  {}", project.name, project.path.display()),
+        });
+    }
+    choices
+}
+
+fn session_menu_choices(config: &Config, store: &SessionStore, project_id: Option<&str>) -> Result<Vec<MenuChoice>> {
+    let mut choices = Vec::new();
+    for session in store.list(project_id)? {
+        if !config.projects.iter().any(|project| project.id == session.project_id) { continue; }
+        choices.push(MenuChoice {
+            command: format!("/resume {}", session.id),
+            description: format!("{}  ·  {:?}  ·  {} messages",
+                session.project_id, session.status, session.messages.len()),
+        });
+    }
+    Ok(choices)
 }
 
 fn list_projects(config: &Config) {

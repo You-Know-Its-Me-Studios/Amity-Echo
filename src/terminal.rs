@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use crossterm::{execute, queue};
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use crossterm::style::{Color, Print, ResetColor, SetForegroundColor};
+use crossterm::style::{Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor};
 use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
@@ -25,6 +25,13 @@ pub enum Input {
     Eof,
 }
 
+/// A live choice supplied by the CLI for the slash menu.
+#[derive(Clone, Debug)]
+pub struct MenuChoice {
+    pub command: String,
+    pub description: String,
+}
+
 pub struct Terminal {
     editor: Option<DefaultEditor>,
     history_path: PathBuf,
@@ -36,6 +43,13 @@ pub struct Terminal {
 enum Tone { Brand, Muted, User, Assistant, Info, Warning, Error, Operation, Tool, Code }
 
 struct ScreenLine { text: String, tone: Tone }
+
+#[derive(Clone)]
+struct MenuItem {
+    command: String,
+    description: String,
+    submit: bool,
+}
 
 struct Screen {
     cwd: PathBuf,
@@ -53,6 +67,11 @@ struct Screen {
     history_position: Option<usize>,
     saved_draft: String,
     engaged: bool,
+    menu_choices: Vec<MenuChoice>,
+    project_connected: bool,
+    menu_index: usize,
+    menu_dismissed: bool,
+    session_menu_loaded: bool,
 }
 
 impl Terminal {
@@ -85,9 +104,20 @@ impl Terminal {
             model: "not connected".into(), lines: Vec::new(), input: String::new(),
             cursor: 0, scroll: 0, status: "Ready".into(), approval: false, raw: false,
             history: Vec::new(), history_position: None, saved_draft: String::new(),
-            engaged: false,
+            engaged: false, menu_choices: Vec::new(), project_connected: false,
+            menu_index: 0, menu_dismissed: false, session_menu_loaded: false,
         }));
         self.draw().context("drawing Echo terminal screen")
+    }
+
+    /// Refresh model and project choices before reading a command.
+    pub fn set_menu_choices(&self, project_connected: bool, choices: Vec<MenuChoice>) {
+        let Some(screen) = &self.screen else { return; };
+        let mut screen = screen.borrow_mut();
+        screen.project_connected = project_connected;
+        screen.menu_choices = choices;
+        screen.menu_index = 0;
+        screen.session_menu_loaded = false;
     }
 
     /// Replace the visible transcript with the selected session's stored conversation.
@@ -143,14 +173,15 @@ impl Terminal {
         let _ = self.draw();
     }
 
-    pub fn read_line(&mut self, project: &str, session: &str) -> Result<Input> {
+    pub fn read_line(&mut self, project: &str, session: &str,
+        session_choices: &mut dyn FnMut() -> Result<Vec<MenuChoice>>) -> Result<Input> {
         if self.screen.is_some() {
             {
                 let mut screen = self.screen.as_ref().expect("screen is present").borrow_mut();
                 screen.project = project.to_owned();
                 screen.session = session.to_owned();
             }
-            return self.read_screen_input(true);
+            return self.read_screen_input(true, Some(session_choices));
         }
         let prompt = format!(
             "{} {} {} ",
@@ -166,7 +197,7 @@ impl Terminal {
             self.log(description, Tone::Warning);
             self.screen.as_ref().expect("screen is present").borrow_mut().approval = true;
             loop {
-                match self.read_screen_input(false)? {
+                match self.read_screen_input(false, None)? {
                     Input::Line(answer) => match answer.trim().to_ascii_lowercase().as_str() {
                         "y" | "yes" => { self.screen.as_ref().expect("screen is present").borrow_mut().approval = false; return Ok(true); }
                         "" | "n" | "no" => { self.screen.as_ref().expect("screen is present").borrow_mut().approval = false; return Ok(false); }
@@ -190,10 +221,11 @@ impl Terminal {
         }
     }
 
-    fn read_screen_input(&mut self, record_input: bool) -> Result<Input> {
+    fn read_screen_input(&mut self, record_input: bool,
+        session_choices: Option<&mut dyn FnMut() -> Result<Vec<MenuChoice>>>) -> Result<Input> {
         terminal::enable_raw_mode().context("enabling Echo keyboard input")?;
         self.screen.as_ref().expect("screen is present").borrow_mut().raw = true;
-        let result = self.screen_input_loop(record_input);
+        let result = self.screen_input_loop(record_input, session_choices);
         let disable = terminal::disable_raw_mode().context("restoring normal terminal input");
         if disable.is_ok() {
             self.screen.as_ref().expect("screen is present").borrow_mut().raw = false;
@@ -202,7 +234,91 @@ impl Terminal {
         result
     }
 
-    fn screen_input_loop(&mut self, record_input: bool) -> Result<Input> {
+    fn menu_items(screen: &Screen) -> Vec<MenuItem> {
+        if screen.approval || screen.menu_dismissed || !screen.input.starts_with('/') {
+            return Vec::new();
+        }
+        let query = screen.input.to_ascii_lowercase();
+        if query.starts_with("/model ") || query.starts_with("/project ") || query.starts_with("/resume ") {
+            let group = if query.starts_with("/model ") { "/model " }
+                else if query.starts_with("/project ") { "/project " }
+                else { "/resume " };
+            let mut items = Vec::new();
+            items.extend(screen.menu_choices.iter()
+                .filter(|choice| choice.command.to_ascii_lowercase().starts_with(group))
+                .map(|choice| MenuItem {
+                    command: choice.command.clone(),
+                    description: choice.description.clone(),
+                    submit: true,
+                }));
+            if group == "/project " {
+                items.push(MenuItem {
+                    command: "/project add ".into(),
+                    description: "Connect an authorized Amity project".into(),
+                    submit: false,
+                });
+            }
+            items.retain(|item| {
+                let command = item.command.to_ascii_lowercase();
+                let matches = command.starts_with(&query)
+                    || (group == "/project " && command.starts_with("/project use ")
+                        && command["/project use ".len()..]
+                            .starts_with(query.strip_prefix(group).unwrap_or_default()));
+                matches && (item.submit || item.command != screen.input)
+            });
+            return items;
+        }
+        if query.starts_with("/config ") {
+            let item = MenuItem {
+                command: "/config host ".into(),
+                description: "Set the Amity host executable path".into(),
+                submit: false,
+            };
+            return if item.command.starts_with(&query) && item.command != screen.input {
+                vec![item]
+            } else { Vec::new() };
+        }
+
+        // The root menu contains only operations the CLI actually handles.
+        let root: &[(&str, &str, bool, bool)] = &[
+            ("/model", "Choose a configured model", false, true),
+            ("/project", "Choose or connect a project", false, false),
+            ("/resume", "Open a saved conversation", false, false),
+            ("/session new", "Start a new conversation", true, true),
+            ("/status", "Inspect the active Amity task", true, false),
+            ("/review", "Review a pending proposal", true, true),
+            ("/approve", "Approve a pending operation", true, true),
+            ("/continue", "Continue active task work", true, true),
+            ("/retry", "Retry the active task", true, true),
+            ("/interrupt", "Interrupt active task work", true, true),
+            ("/cancel", "Cancel the active task", true, true),
+            ("/raw", "Inspect raw host details", true, true),
+            ("/tools", "Show available Amity tools", true, true),
+            ("/report", "Show engineering report", true, true),
+            ("/reconcile", "Reconcile task evidence", true, true),
+            ("/sessions", "List saved conversations", true, false),
+            ("/projects", "List registered projects", true, false),
+            ("/models", "List model profiles", true, false),
+            ("/config", "Show Echo configuration", true, false),
+            ("/task", "Start an Amity coding task", false, true),
+            ("/task-steps", "Run a structured task plan", false, true),
+            ("/help", "Show Echo commands", true, false),
+            ("/exit", "Return to the terminal", true, false),
+        ];
+        root.iter().filter_map(|&(command, description, submit, requires_project)| {
+            if (requires_project && !screen.project_connected) || !command.starts_with(&query) {
+                return None;
+            }
+            Some(MenuItem {
+                command: if submit { command.into() } else { format!("{command} ") },
+                description: description.into(),
+                submit,
+            })
+        }).collect()
+    }
+
+    fn screen_input_loop(&mut self, record_input: bool,
+        mut session_choices: Option<&mut dyn FnMut() -> Result<Vec<MenuChoice>>>) -> Result<Input> {
         self.draw()?;
         loop {
             let event = event::read().context("reading Echo keyboard input")?;
@@ -211,8 +327,15 @@ impl Terminal {
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
                     let mut submitted = None;
                     let mut finished = None;
+                    let mut load_sessions = false;
                     {
                         let mut screen = self.screen.as_ref().expect("screen is present").borrow_mut();
+                        let before_input = screen.input.clone();
+                        let menu = if terminal::size().is_ok_and(|(width, height)| width >= 5 && height > 8) {
+                            Self::menu_items(&screen)
+                        } else { Vec::new() };
+                        let selected = menu.get(screen.menu_index.min(menu.len().saturating_sub(1))).cloned();
+                        let mut navigated_history = false;
                         match key.code {
                             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                                 screen.input.clear(); screen.cursor = 0;
@@ -222,16 +345,38 @@ impl Terminal {
                                 finished = Some(Input::Eof);
                             }
                             KeyCode::Enter => {
-                                let line = std::mem::take(&mut screen.input);
-                                screen.cursor = 0;
-                                screen.history_position = None;
-                                screen.saved_draft.clear();
-                                if record_input && !line.trim().is_empty() {
-                                    screen.history.push(line.clone());
-                                    if screen.history.len() > 100 { screen.history.remove(0); }
-                                    submitted = Some(line.clone());
+                                let line = match selected {
+                                    Some(item) if !item.submit => {
+                                        screen.input = item.command;
+                                        screen.cursor = screen.input.chars().count();
+                                        None
+                                    }
+                                    Some(item) => Some(item.command),
+                                    None => Some(std::mem::take(&mut screen.input)),
+                                };
+                                if let Some(line) = line {
+                                    screen.input.clear();
+                                    screen.cursor = 0;
+                                    screen.history_position = None;
+                                    screen.saved_draft.clear();
+                                    if record_input && !line.trim().is_empty() {
+                                        screen.history.push(line.clone());
+                                        if screen.history.len() > 100 { screen.history.remove(0); }
+                                        submitted = Some(line.clone());
+                                    }
+                                    finished = Some(Input::Line(line));
                                 }
-                                finished = Some(Input::Line(line));
+                            }
+                            KeyCode::Tab => {
+                                if let Some(item) = selected {
+                                    screen.input = item.command;
+                                    screen.cursor = screen.input.chars().count();
+                                }
+                            }
+                            KeyCode::BackTab if !menu.is_empty() => {
+                                screen.menu_index = if screen.menu_index == 0 {
+                                    menu.len() - 1
+                                } else { screen.menu_index - 1 };
                             }
                             KeyCode::Backspace if screen.cursor > 0 => {
                                 let end = byte_index(&screen.input, screen.cursor);
@@ -250,7 +395,16 @@ impl Terminal {
                             KeyCode::End => screen.cursor = screen.input.chars().count(),
                             KeyCode::PageUp => screen.scroll = screen.scroll.saturating_add(8),
                             KeyCode::PageDown => screen.scroll = screen.scroll.saturating_sub(8),
+                            KeyCode::Up if !menu.is_empty() => {
+                                screen.menu_index = if screen.menu_index == 0 {
+                                    menu.len() - 1
+                                } else { screen.menu_index - 1 };
+                            }
+                            KeyCode::Down if !menu.is_empty() => {
+                                screen.menu_index = (screen.menu_index + 1) % menu.len();
+                            }
                             KeyCode::Up if !screen.history.is_empty() => {
+                                navigated_history = true;
                                 if screen.history_position.is_none() { screen.saved_draft = screen.input.clone(); }
                                 let position = screen.history_position.unwrap_or(screen.history.len()).saturating_sub(1);
                                 screen.history_position = Some(position);
@@ -259,6 +413,7 @@ impl Terminal {
                             }
                             KeyCode::Down => {
                                 if let Some(position) = screen.history_position {
+                                    navigated_history = true;
                                     if position + 1 < screen.history.len() {
                                         screen.history_position = Some(position + 1);
                                         screen.input = screen.history[position + 1].clone();
@@ -269,6 +424,7 @@ impl Terminal {
                                     screen.cursor = screen.input.chars().count();
                                 }
                             }
+                            KeyCode::Esc if !menu.is_empty() => { screen.menu_dismissed = true; }
                             KeyCode::Esc => { screen.input.clear(); screen.cursor = 0; screen.history_position = None; }
                             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                                 screen.input.clear(); screen.cursor = 0;
@@ -279,6 +435,24 @@ impl Terminal {
                                 screen.cursor += 1;
                             }
                             _ => {}
+                        }
+                        if screen.input != before_input {
+                            screen.menu_index = 0;
+                            screen.menu_dismissed = navigated_history;
+                        }
+                        if !screen.session_menu_loaded && !screen.approval
+                            && screen.input.starts_with("/resume") && session_choices.is_some() {
+                            screen.session_menu_loaded = true;
+                            load_sessions = true;
+                        }
+                    }
+                    if load_sessions {
+                        if let Some(loader) = session_choices.as_deref_mut() {
+                            match loader() {
+                                Ok(choices) => self.screen.as_ref().expect("screen is present")
+                                    .borrow_mut().menu_choices.extend(choices),
+                                Err(error) => self.warning(&format!("Saved session choices unavailable: {error:#}")),
+                            }
                         }
                     }
                     if let Some(line) = submitted { self.log(&format!("› {line}"), Tone::User); }
@@ -389,7 +563,7 @@ impl Terminal {
                 ("A M I T Y   E C H O", Tone::Brand),
                 ("First-party engineering agent", Tone::Muted),
                 ("Describe a task or ask about your workspace", Tone::Info),
-                ("/help   /model   /projects   /sessions", Tone::Muted),
+                ("Type / for commands   ·   Ctrl+C to exit", Tone::Muted),
             ];
             let start = content_top + content_height.saturating_sub(logo.len()) / 2;
             for (offset, (text, tone)) in logo.iter().enumerate() {
@@ -411,6 +585,42 @@ impl Terminal {
             }
         }
 
+        let menu = Self::menu_items(&screen);
+        let menu_height = menu.len().min(content_height.min(8));
+        if menu_height > 0 {
+            let selected = screen.menu_index.min(menu.len() - 1);
+            let first = selected.saturating_sub(menu_height - 1).min(menu.len() - menu_height);
+            let row_width = width.saturating_sub(2);
+            for (offset, item) in menu[first..first + menu_height].iter().enumerate() {
+                let y = (footer - menu_height + offset) as u16;
+                let active = first + offset == selected;
+                let label_width = if row_width >= 45 { (row_width / 2).min(42) }
+                    else { row_width.saturating_sub(2) };
+                let label = truncate(&Self::clean(&item.command), label_width);
+                let description = if row_width >= 45 {
+                    truncate(&Self::clean(&item.description), row_width.saturating_sub(label_width + 4))
+                } else { String::new() };
+                let line = if description.is_empty() {
+                    format!("{} {label}", if active { "›" } else { " " })
+                } else {
+                    format!("{} {label:<label_width$} {description}", if active { "›" } else { " " })
+                };
+                let line = truncate(&line, row_width);
+                queue!(out, MoveTo(0, y), Clear(ClearType::CurrentLine), MoveTo(1, y))?;
+                if self.color {
+                    if active {
+                        queue!(out, SetBackgroundColor(Color::DarkCyan), SetForegroundColor(Color::White))?;
+                        queue!(out, Print(&line), Print(" ".repeat(row_width.saturating_sub(line.chars().count()))))?;
+                    } else {
+                        queue!(out, SetForegroundColor(Color::DarkGrey), Print(&line))?;
+                    }
+                    queue!(out, ResetColor)?;
+                } else {
+                    queue!(out, Print(&line))?;
+                }
+            }
+        }
+
         self.at(&mut out, 0, footer as u16, width.saturating_sub(1), &"─".repeat(width.saturating_sub(1)), Tone::Muted)?;
         let prefix = if screen.approval { " Approve operation? [y/N]  " } else { " › " };
         let prefix_width = prefix.chars().count().min(width.saturating_sub(1));
@@ -422,6 +632,7 @@ impl Terminal {
             input_width, &visible, Tone::Assistant)?;
         self.at(&mut out, 0, (footer + 2) as u16, width.saturating_sub(1), &"─".repeat(width.saturating_sub(1)), Tone::Muted)?;
         let hint = if screen.approval { " Enter confirm · Ctrl+C decline" }
+            else if menu_height > 0 { " ↑↓ choose · Enter select · Tab complete · Esc close" }
             else if width >= 100 { " Enter send  ·  Ctrl+C exit  ·  ↑↓ history  ·  PgUp/PgDn scroll" }
             else { " Enter send · Ctrl+C exit · ↑↓ history" };
         let status_width = (width / 3).min(30);
