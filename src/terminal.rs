@@ -28,7 +28,7 @@ pub enum Input {
     Eof,
 }
 
-/// A live choice supplied by the CLI for the slash menu.
+/// A human-facing option shown in a terminal picker.
 #[derive(Clone, Debug)]
 pub struct MenuChoice {
     pub command: String,
@@ -92,7 +92,6 @@ struct ScreenLine { text: String, tone: Tone }
 struct MenuItem {
     command: String,
     description: String,
-    submit: bool,
 }
 
 struct Screen {
@@ -112,11 +111,10 @@ struct Screen {
     history_position: Option<usize>,
     saved_draft: String,
     engaged: bool,
-    menu_choices: Vec<MenuChoice>,
-    project_connected: bool,
     menu_index: usize,
     menu_dismissed: bool,
     update_version: Option<String>,
+    text_prompt: bool,
 }
 
 impl Terminal {
@@ -137,6 +135,14 @@ impl Terminal {
         })
     }
 
+    pub fn set_color(&mut self, color: bool) {
+        self.color = color
+            && io::stdout().is_terminal()
+            && env::var_os("NO_COLOR").is_none()
+            && env::var("TERM").ok().as_deref() != Some("dumb");
+        let _ = self.draw();
+    }
+
     pub fn enter_interactive(&mut self, cwd: &Path) -> Result<()> {
         if self.screen.is_some() || !io::stdin().is_terminal() || !io::stdout().is_terminal() {
             return Ok(());
@@ -151,9 +157,10 @@ impl Terminal {
             cursor: 0, scroll: 0, status: "Ready".into(), approval: false,
             decision_prompt: None, raw: false,
             history: Vec::new(), history_position: None, saved_draft: String::new(),
-            engaged: false, menu_choices: Vec::new(), project_connected: false,
+            engaged: false,
             menu_index: 0, menu_dismissed: false,
             update_version: None,
+            text_prompt: false,
         }));
         let (sender, receiver) = mpsc::channel();
         self.update_check = Some(receiver);
@@ -161,15 +168,6 @@ impl Terminal {
             let _ = sender.send(crate::update::available_version());
         });
         self.draw().context("drawing Echo terminal screen")
-    }
-
-    /// Refresh model and project choices before reading a command.
-    pub fn set_menu_choices(&self, project_connected: bool, choices: Vec<MenuChoice>) {
-        let Some(screen) = &self.screen else { return; };
-        let mut screen = screen.borrow_mut();
-        screen.project_connected = project_connected;
-        screen.menu_choices = choices;
-        screen.menu_index = 0;
     }
 
     /// Replace the visible transcript with the selected session's stored conversation.
@@ -189,6 +187,7 @@ impl Terminal {
             screen.saved_draft.clear();
             screen.approval = false;
             screen.decision_prompt = None;
+            screen.text_prompt = false;
             screen.status = match &session.status {
                 SessionStatus::Idle => "Ready",
                 SessionStatus::Running => "Task running",
@@ -245,10 +244,153 @@ impl Terminal {
         self.read_with_prompt(&prompt, true)
     }
 
+    /// Choose a real action without requiring the user to remember its ID.
+    pub fn choose_option(&mut self, title: &str, options: &[MenuChoice]) -> Result<Option<usize>> {
+        if options.is_empty() { return Ok(None); }
+        if self.screen.is_none() {
+            self.info(title);
+            for (index, option) in options.iter().enumerate() {
+                self.info(&format!("{}. {} — {}", index + 1, option.command, option.description));
+            }
+            loop {
+                match self.read_with_prompt("Choose a number (Enter cancels): ", false)? {
+                    Input::Line(answer) if answer.trim().is_empty() => return Ok(None),
+                    Input::Line(answer) => {
+                        if let Ok(index) = answer.trim().parse::<usize>() {
+                            if let Some(index) = index.checked_sub(1).filter(|index| *index < options.len()) {
+                                return Ok(Some(index));
+                            }
+                        }
+                        self.info(&format!("Choose a number from 1 to {}.", options.len()));
+                    }
+                    Input::Interrupt | Input::Eof => return Ok(None),
+                }
+            }
+        }
+        terminal::enable_raw_mode().context("enabling Echo option picker input")?;
+        self.screen.as_ref().expect("screen is present").borrow_mut().raw = true;
+        let result = self.option_picker_loop(title, options);
+        let disable = terminal::disable_raw_mode().context("restoring normal terminal input");
+        if disable.is_ok() {
+            self.screen.as_ref().expect("screen is present").borrow_mut().raw = false;
+        }
+        let redraw = self.draw();
+        disable?;
+        redraw?;
+        result
+    }
+
+    fn option_picker_loop(&self, title: &str, options: &[MenuChoice]) -> Result<Option<usize>> {
+        let mut selected = 0usize;
+        loop {
+            self.draw_option_picker(title, options, selected)?;
+            let list_visible = terminal::size().is_ok_and(|(width, height)| width >= 24 && height >= 8);
+            match event::read().context("reading Echo option picker input")? {
+                Event::Resize(_, _) => {}
+                Event::Key(key) if key.kind != KeyEventKind::Release => match key.code {
+                    KeyCode::Esc => return Ok(None),
+                    KeyCode::Char('c' | 'd') if key.modifiers.contains(KeyModifiers::CONTROL) => return Ok(None),
+                    KeyCode::Enter if list_visible => return Ok(Some(selected)),
+                    KeyCode::Up => selected = selected.saturating_sub(1),
+                    KeyCode::Down => selected = (selected + 1).min(options.len() - 1),
+                    KeyCode::PageUp => selected = selected.saturating_sub(10),
+                    KeyCode::PageDown => selected = (selected + 10).min(options.len() - 1),
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+    }
+
+    fn draw_option_picker(&self, title: &str, options: &[MenuChoice], selected: usize) -> Result<()> {
+        let (width, height) = terminal::size().context("reading terminal size")?;
+        let width = usize::from(width);
+        let height = usize::from(height);
+        if width == 0 || height == 0 { return Ok(()); }
+        let mut out = io::stdout();
+        queue!(out, MoveTo(0, 0), Clear(ClearType::All))?;
+        if width < 24 || height < 8 {
+            self.at(&mut out, 0, 0, width, " AMITY ECHO", Tone::Brand)?;
+            if height > 1 { self.at(&mut out, 0, 1, width, " Enlarge the terminal to choose an option.", Tone::Warning)?; }
+            out.flush()?;
+            return Ok(());
+        }
+        self.at(&mut out, 1, 0, width.saturating_sub(2), &format!("AMITY ECHO  /  {}", Self::clean(title)), Tone::Brand)?;
+        self.at(&mut out, 0, 2, width.saturating_sub(1), &"─".repeat(width.saturating_sub(1)), Tone::Muted)?;
+        let rows = height.saturating_sub(6).max(1);
+        let first = selected.saturating_sub(rows.saturating_sub(1))
+            .min(options.len().saturating_sub(rows));
+        let row_width = width.saturating_sub(2);
+        for (offset, option) in options[first..(first + rows).min(options.len())].iter().enumerate() {
+            let active = first + offset == selected;
+            let label_width = if row_width >= 45 { (row_width / 2).min(42) }
+                else { row_width.saturating_sub(2) };
+            let label = truncate(&Self::clean(&option.command), label_width);
+            let description = if row_width >= 45 {
+                truncate(&Self::clean(&option.description), row_width.saturating_sub(label_width + 4))
+            } else { String::new() };
+            let line = if description.is_empty() {
+                format!("{} {label}", if active { "›" } else { " " })
+            } else {
+                format!("{} {label:<label_width$} {description}", if active { "›" } else { " " })
+            };
+            let line = truncate(&line, row_width);
+            let y = (3 + offset) as u16;
+            queue!(out, MoveTo(0, y), Clear(ClearType::CurrentLine), MoveTo(1, y))?;
+            if self.color && active {
+                queue!(out, SetBackgroundColor(Color::DarkCyan), SetForegroundColor(Color::White),
+                    Print(&line), Print(" ".repeat(row_width.saturating_sub(line.chars().count()))), ResetColor)?;
+            } else {
+                if self.color { queue!(out, SetForegroundColor(Color::Grey))?; }
+                queue!(out, Print(&line), ResetColor)?;
+            }
+        }
+        self.at(&mut out, 0, (height - 2) as u16, width.saturating_sub(1),
+            &"─".repeat(width.saturating_sub(1)), Tone::Muted)?;
+        self.at(&mut out, 1, (height - 1) as u16, width.saturating_sub(2),
+            &format!("{} options · ↑↓ choose · Enter select · Esc back", options.len()), Tone::Muted)?;
+        out.flush().context("drawing Echo option picker")
+    }
+
+    /// Ask for a setup value without displaying or saving the answer in terminal history.
+    pub fn prompt_text(&mut self, question: &str) -> Result<Option<String>> {
+        self.info(question);
+        if self.screen.is_none() {
+            return match self.read_with_prompt("› ", false)? {
+                Input::Line(answer) if answer.trim().is_empty() => Ok(None),
+                Input::Line(answer) => Ok(Some(answer.trim().to_owned())),
+                Input::Interrupt | Input::Eof => Ok(None),
+            };
+        }
+        {
+            let mut screen = self.screen.as_ref().expect("screen is present").borrow_mut();
+            screen.approval = true;
+            screen.text_prompt = true;
+            screen.decision_prompt = Some(" Answer  ".into());
+        }
+        let result = self.read_screen_input(false);
+        {
+            let mut screen = self.screen.as_ref().expect("screen is present").borrow_mut();
+            screen.approval = false;
+            screen.text_prompt = false;
+            screen.decision_prompt = None;
+            screen.input.clear();
+            screen.cursor = 0;
+        }
+        let redraw = self.draw();
+        let answer = result?;
+        redraw?;
+        match answer {
+            Input::Line(answer) if answer.trim().is_empty() => Ok(None),
+            Input::Line(answer) => Ok(Some(answer.trim().to_owned())),
+            Input::Interrupt | Input::Eof => Ok(None),
+        }
+    }
+
     /// Browse saved conversations without changing the active session until one is chosen.
     pub fn choose_session(&mut self, entries: &[SessionPickerEntry]) -> Result<Option<String>> {
         if self.screen.is_none() {
-            anyhow::bail!("the session browser needs an interactive terminal; use `echocli resume <session-id>`");
+            anyhow::bail!("opening the conversation browser requires an interactive terminal");
         }
         terminal::enable_raw_mode().context("enabling Echo session browser input")?;
         self.screen.as_ref().expect("screen is present").borrow_mut().raw = true;
@@ -462,82 +604,13 @@ impl Terminal {
             return Vec::new();
         }
         let query = screen.input.to_ascii_lowercase();
-        if query.starts_with("/model ") || query.starts_with("/project ") || query.starts_with("/resume ") {
-            let group = if query.starts_with("/model ") { "/model " }
-                else if query.starts_with("/project ") { "/project " }
-                else { "/resume " };
-            let mut items = Vec::new();
-            items.extend(screen.menu_choices.iter()
-                .filter(|choice| choice.command.to_ascii_lowercase().starts_with(group))
-                .map(|choice| MenuItem {
-                    command: choice.command.clone(),
-                    description: choice.description.clone(),
-                    submit: true,
-                }));
-            if group == "/project " {
-                items.push(MenuItem {
-                    command: "/project add ".into(),
-                    description: "Connect an authorized Amity project".into(),
-                    submit: false,
-                });
-            }
-            items.retain(|item| {
-                let command = item.command.to_ascii_lowercase();
-                let matches = command.starts_with(&query)
-                    || (group == "/project " && command.starts_with("/project use ")
-                        && command["/project use ".len()..]
-                            .starts_with(query.strip_prefix(group).unwrap_or_default()));
-                matches && (item.submit || item.command != screen.input)
-            });
-            return items;
-        }
-        if query.starts_with("/config ") {
-            let item = MenuItem {
-                command: "/config host ".into(),
-                description: "Set the Amity host executable path".into(),
-                submit: false,
-            };
-            return if item.command.starts_with(&query) && item.command != screen.input {
-                vec![item]
-            } else { Vec::new() };
-        }
-
-        // The root menu contains only operations the CLI actually handles.
-        let root: &[(&str, &str, bool, bool)] = &[
-            ("/model", "Choose a configured model", false, true),
-            ("/project", "Choose or connect a project", false, false),
-            ("/resume", "Browse saved conversations", true, false),
-            ("/session new", "Start a new conversation", true, true),
-            ("/status", "Inspect the active Amity task", true, false),
-            ("/review", "Review a pending proposal", true, true),
-            ("/approve", "Approve a pending operation", true, true),
-            ("/continue", "Continue active task work", true, true),
-            ("/retry", "Retry the active task", true, true),
-            ("/interrupt", "Interrupt active task work", true, true),
-            ("/cancel", "Cancel the active task", true, true),
-            ("/raw", "Inspect raw host details", true, true),
-            ("/tools", "Show available Amity tools", true, true),
-            ("/report", "Show engineering report", true, true),
-            ("/reconcile", "Reconcile task evidence", true, true),
-            ("/sessions", "List saved conversations", true, false),
-            ("/projects", "List registered projects", true, false),
-            ("/models", "List model profiles", true, false),
-            ("/config", "Show Echo configuration", true, false),
-            ("/task", "Start an Amity coding task", false, true),
-            ("/task-steps", "Run a structured task plan", false, true),
-            ("/help", "Show Echo commands", true, false),
-            ("/exit", "Return to the terminal", true, false),
-        ];
-        root.iter().filter_map(|&(command, description, submit, requires_project)| {
-            if (requires_project && !screen.project_connected) || !command.starts_with(&query) {
-                return None;
-            }
-            Some(MenuItem {
-                command: if submit { command.into() } else { format!("{command} ") },
-                description: description.into(),
-                submit,
+        crate::commands::COMMANDS.iter()
+            .filter(|command| command.name.starts_with(&query))
+            .map(|command| MenuItem {
+                command: command.name.to_owned(),
+                description: command.description.to_owned(),
             })
-        }).collect()
+            .collect()
     }
 
     fn screen_input_loop(&mut self, record_input: bool) -> Result<Input> {
@@ -572,27 +645,18 @@ impl Terminal {
                                 finished = Some(Input::Eof);
                             }
                             KeyCode::Enter => {
-                                let line = match selected {
-                                    Some(item) if !item.submit => {
-                                        screen.input = item.command;
-                                        screen.cursor = screen.input.chars().count();
-                                        None
-                                    }
-                                    Some(item) => Some(item.command),
-                                    None => Some(std::mem::take(&mut screen.input)),
-                                };
-                                if let Some(line) = line {
-                                    screen.input.clear();
-                                    screen.cursor = 0;
-                                    screen.history_position = None;
-                                    screen.saved_draft.clear();
-                                    if record_input && !line.trim().is_empty() {
-                                        screen.history.push(line.clone());
-                                        if screen.history.len() > 100 { screen.history.remove(0); }
-                                        if line.trim() != "/resume" { submitted = Some(line.clone()); }
-                                    }
-                                    finished = Some(Input::Line(line));
+                                let line = selected.map(|item| item.command)
+                                    .unwrap_or_else(|| std::mem::take(&mut screen.input));
+                                screen.input.clear();
+                                screen.cursor = 0;
+                                screen.history_position = None;
+                                screen.saved_draft.clear();
+                                if record_input && !line.trim().is_empty() {
+                                    screen.history.push(line.clone());
+                                    if screen.history.len() > 100 { screen.history.remove(0); }
+                                    submitted = Some(line.clone());
                                 }
+                                finished = Some(Input::Line(line));
                             }
                             KeyCode::Tab => {
                                 if let Some(item) = selected {
@@ -650,6 +714,10 @@ impl Terminal {
                                     }
                                     screen.cursor = screen.input.chars().count();
                                 }
+                            }
+                            KeyCode::Esc if screen.text_prompt => {
+                                screen.input.clear(); screen.cursor = 0;
+                                finished = Some(Input::Interrupt);
                             }
                             KeyCode::Esc if !menu.is_empty() => { screen.menu_dismissed = true; }
                             KeyCode::Esc => { screen.input.clear(); screen.cursor = 0; screen.history_position = None; }
@@ -895,7 +963,8 @@ impl Terminal {
         self.at(&mut out, prefix_width as u16, (footer + 1) as u16,
             input_width, &visible, Tone::Assistant)?;
         self.at(&mut out, 0, (footer + 2) as u16, width.saturating_sub(1), &"─".repeat(width.saturating_sub(1)), Tone::Muted)?;
-        let hint = if screen.decision_prompt.is_some() { " Enter choose · Ctrl+C wait" }
+        let hint = if screen.text_prompt { " Enter submit · Esc or Ctrl+C cancel" }
+            else if screen.decision_prompt.is_some() { " Enter choose · Ctrl+C wait" }
             else if screen.approval { " Enter confirm · Ctrl+C decline" }
             else if menu_height > 0 { " ↑↓ choose · Enter select · Tab complete · Esc close" }
             else if width >= 100 { " Enter send  ·  Ctrl+C exit  ·  ↑↓ history  ·  PgUp/PgDn scroll" }
@@ -951,25 +1020,7 @@ impl Terminal {
     }
 
     fn safe_history_command(line: &str) -> bool {
-        let mut parts = line.split_whitespace();
-        let Some(command) = parts.next() else {
-            return false;
-        };
-        let arguments: Vec<_> = parts.collect();
-        match command {
-            "/help" | "/status" | "/sessions" | "/projects" | "/models" | "/config"
-            | "/exit" | "/quit" | "/review" | "/raw" => arguments.is_empty(),
-            "/resume" | "/project" | "/model" | "/task" => {
-                arguments.len() <= 1
-                    && arguments.iter().all(|part| {
-                        part.len() <= 80
-                            && part
-                                .chars()
-                                .all(|ch| ch.is_ascii_alphanumeric() || "_-./\\".contains(ch))
-                    })
-            }
-            _ => false,
-        }
+        crate::commands::find(line).is_some()
     }
 
     pub fn banner(&self, project: &str, session: &str, model: &str) {

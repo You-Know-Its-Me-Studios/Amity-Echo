@@ -1,4 +1,5 @@
 mod agent;
+mod commands;
 mod config;
 mod events;
 mod host;
@@ -9,10 +10,10 @@ mod update;
 
 use agent::Agent;
 use anyhow::{Context, Result, bail};
+use commands::{Command, COMMANDS};
 use config::Config;
-use state::{MessageRole, Session, SessionStore};
+use state::{MessageRole, Session, SessionStatus, SessionStore};
 use std::env;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,26 +28,29 @@ fn main() {
 
 fn run() -> Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
-    if matches!(args.as_slice(), [version] if matches!(version.as_str(), "--version" | "-V" | "version")) {
-        println!("Amity Echo {}", env!("CARGO_PKG_VERSION"));
-        return Ok(());
+    match args.as_slice() {
+        [version] if matches!(version.as_str(), "--version" | "-V") => {
+            println!("Amity Echo {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        [help] if matches!(help.as_str(), "--help" | "-h") => {
+            print_help();
+            return Ok(());
+        }
+        [update] if update == "update" => return update::run(false),
+        [update, check] if update == "update" && check == "--check" => return update::run(true),
+        [update, ..] if update == "update" => bail!("Usage: echocli update [--check]"),
+        _ => {}
     }
-    if args.first().map(String::as_str) == Some("update") {
-        let check_only = match args.as_slice() {
-            [_] => false,
-            [_, check] if check == "--check" => true,
-            _ => bail!("usage: echocli update [--check]"),
-        };
-        return update::run(check_only);
-    }
-    let mut config = Config::load().context("loading Echo configuration")?;
+
+    let mut config = Config::load().context("loading Echo settings")?;
     let cwd = env::current_dir().context("reading current directory")?;
-    let mut auto_registration_error = None;
+    let mut registration_error = None;
     if config.projects.is_empty() {
         if let Some(host_config) = env::var_os("AMITY_HOST_CONFIG") {
             match config.register_host_config(PathBuf::from(host_config)) {
                 Ok(_) => config.save()?,
-                Err(error) => auto_registration_error = Some(error.to_string()),
+                Err(error) => registration_error = Some(error.to_string()),
             }
         }
     }
@@ -57,153 +61,56 @@ fn run() -> Result<()> {
             config.save()?;
         }
     }
-    if args.iter().any(|arg| arg == "--help" || arg == "-h") || args.first().map(String::as_str) == Some("help") {
-        print_help();
-        return Ok(());
-    }
-    if let Some(command) = args.first().map(String::as_str) {
-        match command {
-            "config" => return config_command(&mut config, &args[1..]),
-            "project" | "projects" => return project_command(&mut config, &args[1..]),
-            "model" | "models" => return model_command(&mut config, &args[1..]),
-            _ => {}
-        }
-    }
-    let store = SessionStore::new(&config).context("opening Echo session storage")?;
+
+    let store = SessionStore::new(&config).context("opening Echo conversations")?;
     let cancel = Arc::new(AtomicBool::new(false));
     let signal = Arc::clone(&cancel);
     ctrlc::set_handler(move || { signal.store(true, Ordering::SeqCst); })
         .context("installing Ctrl+C handler")?;
-    let history_path = Config::home_dir().join("history.txt");
-    let mut terminal = Terminal::new(history_path, config.terminal.color)?;
-    if let Some(error) = auto_registration_error {
-        terminal.warning(&format!("AMITY_HOST_CONFIG could not register a project: {error}"));
+    let mut terminal = Terminal::new(Config::home_dir().join("history.txt"), config.terminal.color)?;
+    if let Some(error) = registration_error {
+        terminal.warning(&format!("Could not connect the project from AMITY_HOST_CONFIG: {error}"));
     }
-    match args.first().map(String::as_str) {
-        None => {
+
+    match args.as_slice() {
+        [] => {
             terminal.enter_interactive(&cwd)?;
-            if config.active_project().is_some() {
-                let session = current_session(&config, &store)?;
-                interactive(&mut config, &store, &mut terminal, cancel.as_ref(), session)
-            } else {
-                interactive_without_project(&mut config, &store, &mut terminal, cancel.as_ref())
-            }
-        }
-        Some("resume") => {
-            let session = if let Some(id) = args.get(1) {
-                store.load(id)?
-            } else {
-                terminal.enter_interactive(&cwd)?;
-                let Some(session) = browse_session(&config, &store, &mut terminal)? else { return Ok(()); };
-                session
-            };
-            if config.active_project.as_deref() != Some(&session.project_id) {
-                config.select_project(&session.project_id)?;
-                config.save()?;
-            }
-            terminal.enter_interactive(&cwd)?;
+            let session = if config.active_project().is_some() {
+                Some(current_session(&config, &store)?)
+            } else { None };
             interactive(&mut config, &store, &mut terminal, cancel.as_ref(), session)
         }
-        Some("sessions") => list_sessions(&store, config.active_project.as_deref(), &terminal),
-        Some("status") => {
+        [command] if command == "resume" || command == "sessions" => {
+            terminal.enter_interactive(&cwd)?;
+            let Some(session) = browse_session(&config, &store, &mut terminal)? else { return Ok(()); };
+            select_session_project(&mut config, &session)?;
+            interactive(&mut config, &store, &mut terminal, cancel.as_ref(), Some(session))
+        }
+        [command] if command == "status" => {
+            if config.active_project().is_none() {
+                terminal.info("No project is connected. Open Echo and choose /project to connect one.");
+                return Ok(());
+            }
             let mut session = current_session(&config, &store)?;
             let mut agent = Agent { config: &config, store: &store, session: &mut session,
                 events: &mut terminal, cancel: cancel.as_ref(), interactive: false };
             agent.status()
         }
-        Some("approve") => {
-            if args.get(1).map(String::as_str) != Some("--yes") {
-                bail!("approval requires `echocli approve --yes` or /approve in an interactive session");
-            }
-            let mut session = current_session(&config, &store)?;
-            let mut agent = Agent { config: &config, store: &store, session: &mut session,
-                events: &mut terminal, cancel: cancel.as_ref(), interactive: false };
-            agent.approve()
-        }
-        Some("cancel") => {
-            let mut session = current_session(&config, &store)?;
-            let mut agent = Agent { config: &config, store: &store, session: &mut session,
-                events: &mut terminal, cancel: cancel.as_ref(), interactive: false };
-            agent.cancel_task()
-        }
-        Some("decision") => {
-            let choice = args.get(1).context("usage: echocli decision <choice>")?;
-            if args.len() != 2 { bail!("usage: echocli decision <choice>"); }
-            let mut session = current_session(&config, &store)?;
-            let mut agent = Agent { config: &config, store: &store, session: &mut session,
-                events: &mut terminal, cancel: cancel.as_ref(), interactive: false };
-            agent.decide(choice)
-        }
-        Some("continue") => {
-            let mut session = current_session(&config, &store)?;
-            let mut agent = Agent { config: &config, store: &store, session: &mut session,
-                events: &mut terminal, cancel: cancel.as_ref(), interactive: false };
-            agent.advance_task()
-        }
-        Some("interrupt") => {
-            let mut session = current_session(&config, &store)?;
-            let mut agent = Agent { config: &config, store: &store, session: &mut session,
-                events: &mut terminal, cancel: cancel.as_ref(), interactive: false };
-            agent.interrupt()
-        }
-        Some("review") => {
-            let mut session = current_session(&config, &store)?;
-            let mut agent = Agent { config: &config, store: &store, session: &mut session,
-                events: &mut terminal, cancel: cancel.as_ref(), interactive: false };
-            agent.review()
-        }
-        Some("raw") => {
-            let mut session = current_session(&config, &store)?;
-            let mut agent = Agent { config: &config, store: &store, session: &mut session,
-                events: &mut terminal, cancel: cancel.as_ref(), interactive: false };
-            agent.raw()
-        }
-        Some("tools") => {
-            let mut session = current_session(&config, &store)?;
-            let mut agent = Agent { config: &config, store: &store, session: &mut session,
-                events: &mut terminal, cancel: cancel.as_ref(), interactive: false };
-            agent.capabilities()
-        }
-        Some("report") => {
-            let mut session = current_session(&config, &store)?;
-            let mut agent = Agent { config: &config, store: &store, session: &mut session,
-                events: &mut terminal, cancel: cancel.as_ref(), interactive: false };
-            agent.report()
-        }
-        Some("reconcile") => {
-            let mut session = current_session(&config, &store)?;
-            let mut agent = Agent { config: &config, store: &store, session: &mut session,
-                events: &mut terminal, cancel: cancel.as_ref(), interactive: false };
-            agent.reconcile()
-        }
-        Some("task") => {
-            let instruction = args[1..].join(" ");
-            if instruction.is_empty() { bail!("task instruction is required"); }
-            let mut session = current_session(&config, &store)?;
-            session.append_message(MessageRole::User, &instruction);
-            let safe_instruction = session.messages.last().context("stored message is missing")?.content.clone();
-            store.save(&session)?;
-            let mut agent = Agent { config: &config, store: &store, session: &mut session,
-                events: &mut terminal, cancel: cancel.as_ref(), interactive: false };
-            agent.start_task(&safe_instruction)
-        }
-        Some("task-steps") => {
-            let path = args.get(1).context("task-steps requires a JSON plan file")?;
-            let plan: serde_json::Value = serde_json::from_slice(&fs::read(path)
-                .with_context(|| format!("reading task plan {path}"))?)?;
-            let instruction = plan.get("request").and_then(serde_json::Value::as_str)
-                .context("task plan requires a request string")?.to_owned();
-            let steps = plan.get("steps").context("task plan requires steps")?.clone();
-            let mut session = current_session(&config, &store)?;
-            session.append_message(MessageRole::User, &instruction);
-            let safe_instruction = session.messages.last().context("stored message is missing")?.content.clone();
-            store.save(&session)?;
-            let mut agent = Agent { config: &config, store: &store, session: &mut session,
-                events: &mut terminal, cancel: cancel.as_ref(), interactive: false };
-            agent.start_task_steps(&safe_instruction, steps)
-        }
-        Some(_) => {
+        [command, ..] if matches!(command.as_str(), "resume" | "sessions" | "status") =>
+            bail!("Open `echocli {command}` without extra arguments."),
+        [command, ..] if matches!(command.as_str(),
+            "config" | "project" | "projects" | "model" | "models" | "approve"
+            | "decision" | "continue" | "interrupt" | "review" | "raw" | "tools"
+            | "report" | "reconcile" | "task" | "task-steps" | "cancel" | "retry"
+            | "version" | "help") =>
+            bail!("`echocli {command}` is no longer a shell command. Open Echo and use /help for the available actions."),
+        [first, ..] if first.starts_with('-') || first.starts_with('/') =>
+            bail!("Unknown option `{first}`. Run `echocli --help` for usage."),
+        _ => {
             let instruction = args.join(" ");
+            if config.active_project().is_none() {
+                bail!("No project is connected. Open `echocli`, choose /project, and connect an Amity project.");
+            }
             let mut session = current_session(&config, &store)?;
             let mut agent = Agent { config: &config, store: &store, session: &mut session,
                 events: &mut terminal, cancel: cancel.as_ref(), interactive: false };
@@ -213,7 +120,7 @@ fn run() -> Result<()> {
 }
 
 fn active_project(config: &Config) -> Result<&config::ProjectRegistration> {
-    config.active_project().context("no authorized project is registered; run `echocli project add <path> <amity-host.json>`")
+    config.active_project().context("No project is connected. Open Echo and choose /project.")
 }
 
 fn current_session(config: &Config, store: &SessionStore) -> Result<Session> {
@@ -227,286 +134,319 @@ fn current_session(config: &Config, store: &SessionStore) -> Result<Session> {
     store.create(&project.id, project.selected_model.clone()).map_err(Into::into)
 }
 
-fn interactive_without_project(config: &mut Config, store: &SessionStore, terminal: &mut Terminal,
-    cancel: &AtomicBool) -> Result<()> {
-    terminal.banner("Local workspace", "new", "not connected");
-    loop {
-        cancel.store(false, Ordering::Relaxed);
-        terminal.set_menu_choices(false, menu_choices(config, None));
-        match terminal.read_line("Local workspace", "new")? {
-            Input::Eof => return Ok(()),
-            Input::Interrupt => return Ok(()),
-            Input::Line(line) => {
-                let line = line.trim();
-                if line.is_empty() { continue; }
-                if line == "/exit" || line == "/quit" { return Ok(()); }
-                if line == "/help" { print_interactive_help(terminal); continue; }
-                if line == "/projects" || line == "/project" { terminal.raw(&projects_text(config)); continue; }
-                if line == "/sessions" {
-                    if let Err(error) = list_sessions(store, None, terminal) { terminal.error(&format!("{error:#}")); }
-                    continue;
-                }
-                if line == "/resume" {
-                    match browse_session(config, store, terminal) {
-                        Ok(Some(session)) => {
-                            config.select_project(&session.project_id)?;
-                            config.save()?;
-                            return interactive(config, store, terminal, cancel, session);
-                        }
-                        Ok(None) => {}
-                        Err(error) => terminal.error(&format!("{error:#}")),
-                    }
-                    continue;
-                }
-                if line == "/config" { terminal.raw(&config_text(config)?); continue; }
-                if line == "/status" { terminal.info("Amity is not connected to this workspace."); continue; }
-                if line == "/models" || line == "/model" { terminal.info("Connect an Amity project to see its model profiles."); continue; }
-                if let Some(id) = line.strip_prefix("/resume ") {
-                    let result = store.load(id.trim()).map_err(anyhow::Error::from)
-                        .and_then(|session| {
-                            config.select_project(&session.project_id)?;
-                            config.save()?;
-                            Ok(session)
-                        });
-                    match result {
-                        Ok(session) => return interactive(config, store, terminal, cancel, session),
-                        Err(error) => terminal.error(&format!("{error:#}")),
-                    }
-                    continue;
-                }
-                if let Some(path) = line.strip_prefix("/config host ") {
-                    config.host_executable = PathBuf::from(path.trim().trim_matches('"'));
-                    if let Err(error) = config.save() { terminal.error(&error.to_string()); }
-                    else { terminal.info(&format!("Amity host: {}", config.host_executable.display())); }
-                    continue;
-                }
-                if let Some(path) = line.strip_prefix("/project add ") {
-                    let result = config.register_host_config(path.trim().trim_matches('"'))
-                        .map(|project| project.id.clone()).map_err(anyhow::Error::from)
-                        .and_then(|id| { config.save()?; Ok(id) });
-                    match result {
-                        Ok(id) => {
-                            let session = current_session(config, store)?;
-                            terminal.info(&format!("Connected Amity project {id}"));
-                            return interactive(config, store, terminal, cancel, session);
-                        }
-                        Err(error) => terminal.error(&format!("{error:#}")),
-                    }
-                    continue;
-                }
-                if let Some(id) = line.strip_prefix("/project use ").or_else(|| line.strip_prefix("/project ")) {
-                    let result = config.select_project(id.trim()).map(|project| project.id.clone())
-                        .map_err(anyhow::Error::from).and_then(|id| { config.save()?; Ok(id) });
-                    match result {
-                        Ok(id) => {
-                            let session = current_session(config, store)?;
-                            terminal.info(&format!("Selected Amity project {id}"));
-                            return interactive(config, store, terminal, cancel, session);
-                        }
-                        Err(error) => terminal.error(&format!("{error:#}")),
-                    }
-                    continue;
-                }
-                if line.starts_with('/') {
-                    terminal.warning("Unknown command. Type /help for shortcuts.");
-                } else {
-                    terminal.warning("Amity project and model are not connected. Use /project add <amity-host.json>, then send your task again.");
-                }
-            }
-        }
-    }
-}
-
 fn interactive(config: &mut Config, store: &SessionStore, terminal: &mut Terminal,
-    cancel: &AtomicBool, mut session: Session) -> Result<()> {
-    if !config.projects.iter().any(|project| project.id == session.project_id) {
-        bail!("session project is no longer registered");
-    }
-    terminal.banner(&session.project_id, &session.id, session.model.as_deref().unwrap_or("default"));
-    terminal.load_session(&session);
-    if let Some(task_id) = session.active_task.as_deref() {
-        terminal.info(&format!("Linked Amity task: {task_id}. Use /status or /continue."));
+    cancel: &AtomicBool, mut session: Option<Session>) -> Result<()> {
+    show_session(terminal, session.as_ref());
+    if let Some(current) = session.as_mut() {
+        resume_pending(config, store, terminal, cancel, current);
     }
     loop {
         cancel.store(false, Ordering::Relaxed);
-        terminal.set_menu_choices(true, menu_choices(config, session.model.as_deref()));
-        match terminal.read_line(&session.project_id, &session.id)? {
-            Input::Eof => return Ok(()),
-            Input::Interrupt => return Ok(()),
-            Input::Line(line) => {
-                let line = line.trim();
-                if line.is_empty() { continue; }
-                if line == "/exit" || line == "/quit" { return Ok(()); }
-                if line == "/help" { print_interactive_help(terminal); continue; }
-                if line == "/sessions" {
-                    if let Err(error) = list_sessions(store, Some(&session.project_id), terminal) { terminal.error(&format!("{error:#}")); }
-                    continue;
-                }
-                if line == "/resume" {
-                    let result = (|| -> Result<()> {
-                        let Some(next) = browse_session(config, store, terminal)? else { return Ok(()); };
-                        if next.project_id != session.project_id {
-                            config.select_project(&next.project_id)?;
-                            config.save()?;
+        let project_label = session.as_ref().map(|value| value.project_id.as_str()).unwrap_or("Local workspace");
+        let session_label = session.as_ref().map(|value| value.id.as_str()).unwrap_or("new");
+        let input = terminal.read_line(project_label, session_label)?;
+        let line = match input {
+            Input::Eof | Input::Interrupt => return Ok(()),
+            Input::Line(line) => line,
+        };
+        let line = line.trim();
+        if line.is_empty() { continue; }
+        if line.starts_with('/') {
+            let Some(command) = commands::find(line) else {
+                terminal.warning("Unknown command. Type /help to see available commands.");
+                continue;
+            };
+            let result = match command.id {
+                Command::Help => { print_interactive_help(terminal); Ok(()) }
+                Command::Exit => return Ok(()),
+                Command::Project => {
+                    (|| -> Result<()> {
+                        if choose_project(config, terminal)? {
+                            session = Some(current_session(config, store)?);
+                            show_session(terminal, session.as_ref());
+                            if let Some(current) = session.as_mut() {
+                                resume_pending(config, store, terminal, cancel, current);
+                            }
                         }
-                        session = next;
-                        terminal.context(&session.project_id, &session.id, session.model.as_deref().unwrap_or("default"));
-                        terminal.load_session(&session);
                         Ok(())
-                    })();
-                    if let Err(error) = result { terminal.error(&format!("{error:#}")); }
-                    continue;
+                    })()
                 }
-                if line == "/projects" || line == "/project" { terminal.raw(&projects_text(config)); continue; }
-                if line == "/models" || line == "/model" { terminal.raw(&models_text(config)); continue; }
-                if line == "/config" { terminal.raw(&config_text(config)?); continue; }
-                if let Some(path) = line.strip_prefix("/config host ") {
-                    config.host_executable = PathBuf::from(path.trim().trim_matches('"'));
-                    if let Err(error) = config.save() { terminal.error(&error.to_string()); }
-                    else { terminal.info(&format!("Amity host: {}", config.host_executable.display())); }
-                    continue;
-                }
-                if let Some(id) = line.strip_prefix("/resume ") {
-                    let result = (|| -> Result<()> {
-                        let next = store.load(id.trim())?;
-                        if next.project_id != session.project_id { config.select_project(&next.project_id)?; config.save()?; }
-                        session = next;
-                        terminal.context(&session.project_id, &session.id, session.model.as_deref().unwrap_or("default"));
-                        terminal.load_session(&session);
+                Command::Sessions => {
+                    (|| -> Result<()> {
+                        if let Some(next) = browse_session(config, store, terminal)? {
+                            select_session_project(config, &next)?;
+                            session = Some(next);
+                            show_session(terminal, session.as_ref());
+                            if let Some(current) = session.as_mut() {
+                                resume_pending(config, store, terminal, cancel, current);
+                            }
+                        }
                         Ok(())
-                    })();
-                    if let Err(error) = result { terminal.error(&format!("{error:#}")); }
-                    continue;
+                    })()
                 }
-                if line == "/session new" {
-                    let result = (|| -> Result<()> {
-                        let project = active_project(config)?;
-                        session = store.create(&project.id, project.selected_model.clone())?;
-                        terminal.context(&session.project_id, &session.id, session.model.as_deref().unwrap_or("default"));
-                        terminal.load_session(&session);
+                Command::NewSession => {
+                    (|| -> Result<()> {
+                        if let Some(project) = config.active_project() {
+                            session = Some(store.create(&project.id, project.selected_model.clone())?);
+                            show_session(terminal, session.as_ref());
+                        } else {
+                            terminal.info("Connect a project with /project before starting a conversation.");
+                        }
                         Ok(())
-                    })();
-                    if let Err(error) = result { terminal.error(&format!("{error:#}")); }
-                    continue;
+                    })()
                 }
-                if let Some(path) = line.strip_prefix("/project add ") {
-                    let result = (|| -> Result<()> {
-                        config.register_host_config(path.trim().trim_matches('"'))?;
-                        config.save()?;
-                        session = current_session(config, store)?;
-                        terminal.context(&session.project_id, &session.id, session.model.as_deref().unwrap_or("default"));
-                        terminal.load_session(&session);
+                Command::Model => {
+                    if let Some(current) = session.as_mut() {
+                        choose_model(config, store, terminal, current)
+                    } else {
+                        terminal.info("Connect a project with /project before choosing a model.");
                         Ok(())
-                    })();
-                    if let Err(error) = result { terminal.error(&format!("{error:#}")); }
-                    continue;
-                }
-                if let Some(id) = line.strip_prefix("/project use ").or_else(|| line.strip_prefix("/project ")) {
-                    let result = (|| -> Result<()> {
-                        config.select_project(id.trim())?;
-                        config.save()?;
-                        session = current_session(config, store)?;
-                        terminal.context(&session.project_id, &session.id, session.model.as_deref().unwrap_or("default"));
-                        terminal.load_session(&session);
-                        Ok(())
-                    })();
-                    if let Err(error) = result { terminal.error(&format!("{error:#}")); }
-                    continue;
-                }
-                if let Some(name) = line.strip_prefix("/model ") {
-                    let result = (|| -> Result<()> {
-                        let model = if name.trim() == "default" { None } else { Some(name.trim()) };
-                        config.active_project_mut().context("no active project")?.select_model(model)?;
-                        config.save()?;
-                        session.model = model.map(str::to_owned);
-                        store.save(&session)?;
-                        terminal.context(&session.project_id, &session.id, model.unwrap_or("default"));
-                        terminal.info(&format!("Selected Amity model profile {}", model.unwrap_or("default")));
-                        Ok(())
-                    })();
-                    if let Err(error) = result { terminal.error(&format!("{error:#}")); }
-                    continue;
-                }
-                let mut agent = Agent { config, store, session: &mut session, events: terminal, cancel, interactive: true };
-                let result = match line {
-                    "/status" => agent.status(),
-                    "/review" => agent.review(),
-                    "/approve" => agent.approve(),
-                    "/cancel" => agent.cancel_task(),
-                    "/retry" => agent.retry(),
-                    "/interrupt" => agent.interrupt(),
-                    "/continue" => agent.advance_task(),
-                    "/raw" => agent.raw(),
-                    "/tools" => agent.capabilities(),
-                    "/report" => agent.report(),
-                    "/reconcile" => agent.reconcile(),
-                    _ if line.starts_with("/task ") => {
-                        let instruction = line.trim_start_matches("/task ").trim();
-                        agent.session.append_message(MessageRole::User, instruction);
-                        let safe_instruction = agent.session.messages.last().context("stored message is missing")?.content.clone();
-                        agent.store.save(agent.session)?;
-                        agent.start_task(&safe_instruction)
                     }
-                    _ if line.starts_with("/task-steps ") => {
-                        (|| -> Result<()> {
-                            let path = line.trim_start_matches("/task-steps ").trim();
-                            let plan: serde_json::Value = serde_json::from_slice(&fs::read(path)?)?;
-                            let instruction = plan.get("request").and_then(serde_json::Value::as_str)
-                                .context("task plan requires a request string")?.to_owned();
-                            let steps = plan.get("steps").context("task plan requires steps")?.clone();
-                            agent.session.append_message(MessageRole::User, &instruction);
-                            let safe_instruction = agent.session.messages.last().context("stored message is missing")?.content.clone();
-                            agent.store.save(agent.session)?;
-                            agent.start_task_steps(&safe_instruction, steps)
-                        })()
+                }
+                Command::Settings => choose_settings(config, terminal),
+                Command::Status => {
+                    if let Some(current) = session.as_mut() {
+                        let mut agent = Agent { config, store, session: current, events: terminal,
+                            cancel, interactive: true };
+                        agent.status()
+                    } else {
+                        terminal.info("Echo is ready. Connect a project with /project to start coding.");
+                        Ok(())
                     }
-                    _ if line.starts_with('/') => { agent.events.warning("Unknown command. Type /help."); Ok(()) }
-                    _ => agent.instruction(line),
-                };
-                if let Err(error) = result { agent.events.error(&format!("{error:#}")); }
-            }
+                }
+                Command::ReviewChanges => {
+                    if let Some(current) = session.as_mut() {
+                        let mut agent = Agent { config, store, session: current, events: terminal,
+                            cancel, interactive: true };
+                        agent.review()
+                    } else {
+                        terminal.info("No changes to review. Connect a project with /project.");
+                        Ok(())
+                    }
+                }
+                Command::Cancel => {
+                    if let Some(current) = session.as_mut() {
+                        if matches!(&current.status, SessionStatus::Running | SessionStatus::WaitingApproval
+                            | SessionStatus::AwaitingUserDecision | SessionStatus::Interrupted | SessionStatus::Failed)
+                            && (current.active_task.is_some() || current.pending_policy_change.is_some()) {
+                            let mut agent = Agent { config, store, session: current, events: terminal,
+                                cancel, interactive: true };
+                            agent.cancel_task()
+                        } else {
+                            terminal.info("There is no active operation to cancel.");
+                            Ok(())
+                        }
+                    } else {
+                        terminal.info("There is no active operation to cancel.");
+                        Ok(())
+                    }
+                }
+            };
+            if let Err(error) = result { terminal.error(&format!("{error:#}")); }
+            continue;
+        }
+        if let Some(current) = session.as_mut() {
+            let mut agent = Agent { config, store, session: current, events: terminal,
+                cancel, interactive: true };
+            if let Err(error) = agent.instruction(line) { agent.events.error(&format!("{error:#}")); }
+        } else {
+            terminal.info("Connect a project with /project, then send your request again.");
         }
     }
 }
 
-fn list_sessions(store: &SessionStore, project_id: Option<&str>, terminal: &Terminal) -> Result<()> {
-    let sessions = store.list(project_id)?;
-    if sessions.is_empty() { terminal.info("No sessions found."); return Ok(()); }
-    for session in sessions {
-        terminal.raw(&format!("{}  {}  {:?}  task {}  {} messages",
-            session.id, session.project_id, session.status,
-            session.active_task.as_deref().unwrap_or("—"), session.messages.len()));
+fn show_session(terminal: &Terminal, session: Option<&Session>) {
+    if let Some(session) = session {
+        terminal.context(&session.project_id, &session.id, session.model.as_deref().unwrap_or("default"));
+        terminal.load_session(session);
+    } else {
+        terminal.banner("Local workspace", "new", "not connected");
+    }
+}
+
+fn resume_pending(config: &Config, store: &SessionStore, terminal: &mut Terminal,
+    cancel: &AtomicBool, session: &mut Session) {
+    let result = match session.status.clone() {
+        SessionStatus::AwaitingUserDecision => {
+            let mut agent = Agent { config, store, session, events: terminal, cancel, interactive: true };
+            agent.instruction("")
+        }
+        SessionStatus::WaitingApproval => {
+            let mut agent = Agent { config, store, session, events: terminal, cancel, interactive: true };
+            agent.review()
+        }
+        SessionStatus::Interrupted | SessionStatus::Failed if session.active_task.is_some() => {
+            let options = [
+                MenuChoice { command: "Resume work".into(), description: "Continue the saved task".into() },
+                MenuChoice { command: "Cancel work".into(), description: "Stop the saved task".into() },
+                MenuChoice { command: "Later".into(), description: "Keep it for another time".into() },
+            ];
+            match terminal.choose_option("Continue this conversation?", &options) {
+                Ok(Some(0)) => {
+                    let mut agent = Agent { config, store, session, events: terminal, cancel, interactive: true };
+                    agent.retry()
+                }
+                Ok(Some(1)) => {
+                    let mut agent = Agent { config, store, session, events: terminal, cancel, interactive: true };
+                    agent.cancel_task()
+                }
+                Ok(_) => Ok(()),
+                Err(error) => Err(error),
+            }
+        }
+        _ => Ok(()),
+    };
+    if let Err(error) = result { terminal.error(&format!("{error:#}")); }
+}
+
+fn choose_project(config: &mut Config, terminal: &mut Terminal) -> Result<bool> {
+    let mut options: Vec<MenuChoice> = config.projects.iter().map(|project| MenuChoice {
+        command: project.name.clone(),
+        description: format!("{}{}", project.path.display(),
+            if config.active_project.as_deref() == Some(&project.id) { "  ·  current" } else { "" }),
+    }).collect();
+    options.push(MenuChoice { command: "Connect a project".into(),
+        description: "Choose its Amity connection file".into() });
+    let Some(index) = terminal.choose_option("Choose a project", &options)? else { return Ok(false); };
+    if index == config.projects.len() {
+        let Some(path) = terminal.prompt_text("Path to this project's Amity connection JSON file")? else {
+            return Ok(false);
+        };
+        if path.trim().is_empty() { return Ok(false); }
+        let mut next = config.clone();
+        let id = next.register_host_config(path.trim().trim_matches('"'))?.id.clone();
+        next.save()?;
+        *config = next;
+        terminal.info(&format!("Connected project {id}."));
+    } else {
+        let id = config.projects[index].id.clone();
+        if config.active_project.as_deref() == Some(&id) { return Ok(false); }
+        let mut next = config.clone();
+        next.select_project(&id)?;
+        next.save()?;
+        *config = next;
+        terminal.info(&format!("Switched to {}.", config.projects[index].name));
+    }
+    Ok(true)
+}
+
+fn select_session_project(config: &mut Config, session: &Session) -> Result<()> {
+    if config.active_project.as_deref() != Some(&session.project_id) {
+        config.select_project(&session.project_id)?;
+        config.save()?;
     }
     Ok(())
 }
 
-fn menu_choices(config: &Config, active_model: Option<&str>) -> Vec<MenuChoice> {
-    let mut choices = Vec::new();
-    if let Some(project) = config.active_project() {
-        choices.push(MenuChoice {
-            command: "/model default".into(),
-            description: if active_model.is_none() { "Current model profile".into() }
-                else { "Use the project's default model profile".into() },
-        });
-        for model in &project.models {
-            choices.push(MenuChoice {
-                command: format!("/model {}", model.name),
-                description: if active_model == Some(model.name.as_str()) {
-                    "Current model profile".into()
-                } else {
-                    format!("Use {} for this project", model.name)
-                },
-            });
-        }
+fn choose_model(config: &mut Config, store: &SessionStore, terminal: &mut Terminal,
+    session: &mut Session) -> Result<()> {
+    let models = active_project(config)?.models.clone();
+    let mut options = vec![MenuChoice {
+        command: "Project default".into(),
+        description: if session.model.is_none() { "Current model".into() }
+            else { "Use the model in this project's Amity connection".into() },
+    }];
+    for model in &models {
+        options.push(MenuChoice { command: model.name.clone(),
+            description: if session.model.as_deref() == Some(&model.name) {
+                "Current model".into()
+            } else { "Configured model".into() } });
     }
-    for project in &config.projects {
-        choices.push(MenuChoice {
-            command: format!("/project use {}", project.id),
-            description: format!("{}  ·  {}", project.name, project.path.display()),
-        });
-    }
-    choices
+    options.push(MenuChoice { command: "Add a model".into(),
+        description: "Connect another model for this project".into() });
+    let Some(index) = terminal.choose_option("Choose an AI model", &options)? else { return Ok(()); };
+    let mut next_config = config.clone();
+    let selected = if index == options.len() - 1 {
+        let Some(name) = terminal.prompt_text("Name for this model")? else { return Ok(()); };
+        if name.trim().is_empty() { bail!("Enter a model name."); }
+        let Some(path) = terminal.prompt_text("Path to its Amity connection JSON file")? else {
+            return Ok(());
+        };
+        if path.trim().is_empty() { bail!("Enter the connection file path."); }
+        next_config.active_project_mut().context("No project is selected")?
+            .add_model(name.trim(), path.trim().trim_matches('"'))?;
+        Some(name.trim().to_owned())
+    } else if index == 0 { None } else {
+        Some(models[index - 1].name.clone())
+    };
+    next_config.active_project_mut().context("No project is selected")?
+        .select_model(selected.as_deref())?;
+    next_config.save()?;
+    let mut next_session = session.clone();
+    next_session.model = selected.clone();
+    store.save(&next_session)?;
+    *config = next_config;
+    *session = next_session;
+    terminal.context(&session.project_id, &session.id, selected.as_deref().unwrap_or("default"));
+    terminal.info(&format!("Using {}.", selected.as_deref().unwrap_or("the project's default model")));
+    Ok(())
 }
+
+fn choose_settings(config: &mut Config, terminal: &mut Terminal) -> Result<()> {
+    loop {
+        let options = vec![
+            MenuChoice { command: "Amity app location".into(),
+                description: config.host_executable.display().to_string() },
+            MenuChoice { command: "Terminal colors".into(),
+                description: on_off(config.terminal.color).into() },
+            MenuChoice { command: "Detailed operation results".into(),
+                description: on_off(config.terminal.show_tool_details).into() },
+            MenuChoice { command: "Ask before execution".into(),
+                description: on_off(config.execution.ask_before_execution).into() },
+            MenuChoice { command: "Continue task automatically".into(),
+                description: on_off(config.execution.auto_continue).into() },
+            MenuChoice { command: "Time to wait for Amity".into(),
+                description: format!("{} seconds", config.resources.host_timeout_seconds) },
+            MenuChoice { command: "Maximum work rounds".into(),
+                description: config.resources.max_agent_turns.to_string() },
+            MenuChoice { command: "Conversation memory length".into(),
+                description: format!("{} messages", config.resources.max_history_messages) },
+        ];
+        let Some(index) = terminal.choose_option("Echo settings", &options)? else { return Ok(()); };
+        let mut next = config.clone();
+        let mut changed = true;
+        match index {
+            0 => {
+                if let Some(value) = terminal.prompt_text("Path or command used to open Amity")? {
+                    if !value.trim().is_empty() { next.host_executable = PathBuf::from(value.trim().trim_matches('"')); }
+                    else { changed = false; }
+                } else { changed = false; }
+            }
+            1 => next.terminal.color = !next.terminal.color,
+            2 => next.terminal.show_tool_details = !next.terminal.show_tool_details,
+            3 => next.execution.ask_before_execution = !next.execution.ask_before_execution,
+            4 => next.execution.auto_continue = !next.execution.auto_continue,
+            5 => if let Some(value) = terminal.prompt_text("Timeout in seconds")? {
+                if !value.trim().is_empty() { next.resources.host_timeout_seconds = positive(&value)?; }
+                else { changed = false; }
+            } else { changed = false; },
+            6 => if let Some(value) = terminal.prompt_text("Maximum work rounds per request")? {
+                if !value.trim().is_empty() { next.resources.max_agent_turns = usize::try_from(positive(&value)?)
+                    .context("Number is too large for this computer")?; }
+                else { changed = false; }
+            } else { changed = false; },
+            7 => if let Some(value) = terminal.prompt_text("Maximum conversation messages sent to the model")? {
+                if !value.trim().is_empty() { next.resources.max_history_messages = usize::try_from(positive(&value)?)
+                    .context("Number is too large for this computer")?; }
+                else { changed = false; }
+            } else { changed = false; },
+            _ => unreachable!(),
+        }
+        if !changed { continue; }
+        next.save()?;
+        *config = next;
+        if index == 1 { terminal.set_color(config.terminal.color); }
+        terminal.info("Setting saved.");
+    }
+}
+
+fn positive(value: &str) -> Result<u64> {
+    let parsed: u64 = value.trim().parse().context("Enter a whole number greater than zero")?;
+    if parsed == 0 { bail!("Enter a number greater than zero."); }
+    Ok(parsed)
+}
+
+fn on_off(value: bool) -> &'static str { if value { "On" } else { "Off" } }
 
 fn browse_session(config: &Config, store: &SessionStore, terminal: &mut Terminal) -> Result<Option<Session>> {
     let entries = session_picker_entries(config, store)?;
@@ -530,13 +470,8 @@ fn session_picker_entries(config: &Config, store: &SessionStore) -> Result<Vec<S
             .map(|line| line.trim().chars().take(120).collect())
             .unwrap_or_else(|| "New conversation".to_owned());
         entries.push(SessionPickerEntry {
-            id: session.id,
-            title,
-            project_name: project.name.clone(),
-            directory,
-            cwd_match,
-            created_at_ms: session.created_at_ms,
-            updated_at_ms: session.updated_at_ms,
+            id: session.id, title, project_name: project.name.clone(), directory, cwd_match,
+            created_at_ms: session.created_at_ms, updated_at_ms: session.updated_at_ms,
             status: session.status,
         });
     }
@@ -555,166 +490,23 @@ fn session_matches_cwd(session: &Session, cwd: &Path, project_root: &Path) -> bo
     }
 }
 
-fn list_projects(config: &Config) {
-    print!("{}", projects_text(config));
-}
-
-fn projects_text(config: &Config) -> String {
-    let mut output = String::new();
-    if config.projects.is_empty() { return "No Amity projects registered.\n".into(); }
-    for project in &config.projects {
-        let mark = if config.active_project.as_deref() == Some(&project.id) { "*" } else { " " };
-        output.push_str(&format!("{mark} {}  {}  {}\n", project.id, project.path.display(), project.host_config.display()));
-    }
-    output
-}
-
-fn list_models(config: &Config) {
-    print!("{}", models_text(config));
-}
-
-fn models_text(config: &Config) -> String {
-    let mut output = String::new();
-    if let Some(project) = config.active_project() {
-        output.push_str(&format!("{} default  {}\n", if project.selected_model.is_none() { "*" } else { " " }, project.host_config.display()));
-        for model in &project.models {
-            output.push_str(&format!("{} {}  {}\n", if project.selected_model.as_deref() == Some(&model.name) { "*" } else { " " }, model.name, model.host_config.display()));
-        }
-    }
-    output
-}
-
-fn show_config(config: &Config) -> Result<()> {
-    print!("{}", config_text(config)?);
-    Ok(())
-}
-
-fn config_text(config: &Config) -> Result<String> {
-    Ok(format!("Echo config: {}\n{}\n", Config::path().display(), serde_json::to_string_pretty(config)?))
-}
-
-fn config_command(config: &mut Config, args: &[String]) -> Result<()> {
-    match args {
-        [] => show_config(config),
-        [action, path] if action == "host" => {
-            config.host_executable = PathBuf::from(path);
-            config.save()?;
-            show_config(config)
-        }
-        [action, value] if action == "timeout" => {
-            let seconds: u64 = value.parse().context("timeout must be seconds")?;
-            if seconds == 0 { bail!("timeout must be positive"); }
-            config.resources.host_timeout_seconds = seconds;
-            config.save()?;
-            show_config(config)
-        }
-        [action, value] if action == "color" => {
-            config.terminal.color = parse_bool(value)?;
-            config.save()?;
-            show_config(config)
-        }
-        [action, value] if action == "ask-before-execution" => {
-            config.execution.ask_before_execution = parse_bool(value)?;
-            config.save()?;
-            show_config(config)
-        }
-        _ => bail!("usage: echocli config [host <executable> | timeout <seconds> | color <on|off> | ask-before-execution <on|off>]"),
-    }
-}
-
-fn project_command(config: &mut Config, args: &[String]) -> Result<()> {
-    match args {
-        [] => { list_projects(config); Ok(()) }
-        [list] if list == "list" => { list_projects(config); Ok(()) }
-        [action, host_config] if action == "add" => {
-            let id = config.register_host_config(host_config)?.id.clone();
-            config.save()?;
-            println!("Registered project {id}");
-            Ok(())
-        }
-        [action, path, host_config] if action == "add" => {
-            let id = config.register_project(path, host_config)?.id.clone();
-            config.save()?;
-            println!("Registered project {id}");
-            Ok(())
-        }
-        [action, id] if action == "use" => {
-            let id = config.select_project(id)?.id.clone();
-            config.save()?;
-            println!("Selected project {id}");
-            Ok(())
-        }
-        _ => bail!("usage: echocli project [list | add <amity-host.json> | add <directory> <amity-host.json> | use <id>]"),
-    }
-}
-
-fn model_command(config: &mut Config, args: &[String]) -> Result<()> {
-    match args {
-        [] => { list_models(config); Ok(()) }
-        [list] if list == "list" => { list_models(config); Ok(()) }
-        [action, name, host_config] if action == "add" => {
-            active_project(config)?;
-            config.active_project_mut().context("no active project")?.add_model(name, host_config)?;
-            config.save()?;
-            println!("Added model profile {name}");
-            Ok(())
-        }
-        [action, name] if action == "use" => {
-            let name = if name == "default" { None } else { Some(name.as_str()) };
-            config.active_project_mut().context("no active project")?.select_model(name)?;
-            config.save()?;
-            let project = active_project(config)?;
-            let project_id = project.id.clone();
-            let project_root = project.path.clone();
-            let store = SessionStore::new(config)?;
-            let cwd = env::current_dir()?;
-            let cwd = cwd.canonicalize().unwrap_or(cwd);
-            if let Some(mut session) = store.list(Some(&project_id))?.into_iter()
-                .find(|session| session_matches_cwd(session, &cwd, &project_root)) {
-                session.model = name.map(str::to_owned);
-                store.save(&session)?;
-            }
-            println!("Selected model profile {}", name.unwrap_or("default"));
-            Ok(())
-        }
-        _ => bail!("usage: echocli model [list | add <name> <amity-host.json> | use <name|default>]"),
-    }
-}
-
-fn parse_bool(value: &str) -> Result<bool> {
-    match value { "on" | "true" => Ok(true), "off" | "false" => Ok(false), _ => bail!("expected on or off") }
-}
-
 fn print_help() {
-    println!("Amity Echo · first-party coding agent\n\
-echocli                          Interactive agent\n\
-echocli \"instruction\"            Ask or request a coding task\n\
-echocli task \"instruction\"       Force an Amity coding task\n\
-echocli task-steps <plan.json>    Run a structured multistep Amity task\n\
-echocli resume [session-id]      Browse sessions or reopen one by ID\n\
-echocli sessions                 List project sessions\n\
-echocli status                   Inspect active task\n\
-echocli update                   Install the latest GitHub Release\n\
-echocli update --check           Check for a newer release\n\
-echocli --version                Show the installed Echo version\n\
-echocli review                   Show pending gateway proposal\n\
-echocli approve --yes            Explicitly approve and execute pending proposal\n\
-echocli decision <choice>         Resolve a pending Amity policy decision\n\
-echocli continue | interrupt | cancel | raw  Manage or inspect active task\n\
-echocli tools | report | reconcile Inspect host capabilities and evidence\n\
-echocli project add <amity-host.json>  Register its bound project\n\
-echocli project add <path> <amity-host.json>\n\
-echocli project use <id> | project list\n\
-echocli model add <name> <amity-host.json>\n\
-echocli model use <name|default> | model list\n\
-echocli config [host <path> | timeout <seconds> | color <on|off> | ask-before-execution <on|off>]\n\
-AMITY_HOST_TOKEN is read from the environment and never stored by Echo.\n\
-AMITY_HOST_CONFIG can register its bound project on first launch.");
+    println!("Amity Echo · coding agent\n\
+echocli                         Open Echo\n\
+echocli \"instruction\"           Ask Echo to work in this project\n\
+echocli resume                  Browse and reopen conversations\n\
+echocli sessions                Browse conversations\n\
+echocli status                  See what Echo is doing\n\
+echocli update [--check]        Install or check for an update\n\
+echocli --version               Show the installed version\n\
+echocli --help                  Show this help\n\nInside Echo:");
+    for command in COMMANDS {
+        println!("  {:<18} {}", command.name, command.description);
+    }
 }
 
 fn print_interactive_help(terminal: &Terminal) {
-    terminal.raw("/help  /status  /review  /approve  /continue  /retry  /interrupt  /cancel  /raw\n\
-/tools  /report  /reconcile  /task-steps <plan.json>\n\
-/sessions  /resume  /resume <id>  /session new  /projects  /project add <amity-host.json>  /project <id>\n\
-/models  /model <name|default>  /config host <amity-executable>  /task <instruction>  /exit");
+    for command in COMMANDS {
+        terminal.info(&format!("{:<18} {}", command.name, command.description));
+    }
 }

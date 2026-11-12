@@ -1,60 +1,55 @@
 # Amity Echo
 
-Amity Echo is a local Rust coding agent launched as `echocli`. It keeps its own conversations and delegates project context, ACL decisions, task orchestration, gateway changes, approvals, and engineering evidence to the existing Amity host.
+Amity Echo is a local coding agent launched with `echocli`. It keeps conversations on your computer and uses the existing Amity host for project context, permissions, code changes, and engineering evidence.
 
-## Setup
+## Install and connect
 
-Echo needs an initialized Amity project, its existing host JSON configuration, an `amity` host executable, and `AMITY_HOST_TOKEN` in the calling environment. The token is passed to the host process and is not saved in Echo configuration. The selected Amity host config must contain a configured `model_command`, `model_version`, and authorized `model_actor_id` for agent work. The model command follows Amity's `ModelInput` JSON on stdin and `ModelTurn` JSON on stdout contract. Echo does not provide an inference runtime or provision model membership.
+Install the Rust binary from this directory with `cargo install --path . --force`. This adds `echocli` to your terminal. Installations made before Echo gained its update command need this one-time reinstall.
 
-Install the Rust binary from this directory with `cargo install --path . --force`; this creates the `echocli` command. Installations that predate the update command need this one-time reinstall.
+Run `echocli` from any directory. Echo opens even when no project is connected. Use `/project` to select a connected project or connect one using its existing Amity host JSON configuration. Use `/settings` to set the Amity host executable if Echo cannot find it. The connection must point to an initialized and authorized Amity project. The selected host configuration needs a working `model_command`, `model_version`, and authorized `model_actor_id` for agent work. Echo does not provide its own model inference runtime or grant model permissions.
 
-## Updates
+If `AMITY_HOST_CONFIG` points to an existing host JSON file, Echo can register its bound project on first launch. When you open Echo inside a registered project, it selects that project automatically. Elsewhere it retains your selected project and shows the current working directory. `AMITY_HOST_TOKEN` is read from the environment and passed to the host; Echo does not save it in its configuration.
 
-Windows x64 releases are published to the public [Amity Echo GitHub Releases](https://github.com/You-Know-Its-Me-Studios/Amity-Echo/releases) page. `echocli --version` shows the installed version. When the interactive terminal opens, Echo checks the latest release in the background and shows `echocli update` in the top bar if a newer Windows build is available. The check never installs anything or delays input. If it cannot reach GitHub, the terminal opens normally without an update notice. `echocli update --check` reports the latest version and release link without installing it. Run `echocli update` from any directory to download the latest release, verify its size and SHA-256 checksum, check GitHub's release digest when supplied, then replace the installed executable. Restart `echocli` to use the new version. Development binaries under `target` must be installed through Cargo instead. No GitHub account or GitHub CLI is needed for version 0.1.2 and later. Echo's local configuration and sessions are separate from the executable.
-
-Version 0.1.1 still uses the GitHub CLI for its own update command. To move from 0.1.1 to 0.1.2, use that command with an authenticated `gh`, or reinstall once from this checkout with `cargo install --path . --force`.
-
-For maintainers, set the new version in `Cargo.toml`, commit it on `main`, then push a matching `v<version>` tag pointing to that commit. The tag starts the Windows release workflow. It builds `echocli-x86_64-pc-windows-msvc.exe` from the tracked `Cargo.lock` and publishes that asset with `echocli-x86_64-pc-windows-msvc.exe.sha256` in the same release. A source commit alone does not publish an update.
-
-`echocli` opens Echo's full-screen terminal from any directory, including before a project is connected. The composer remains available; `/project add <amity-host.json>` and `/config host <amity-executable>` connect the existing Amity infrastructure. Press Ctrl+C at the idle composer to return to the shell. During model or host work, Ctrl+C cancels the active operation. Project instructions need a connected, authorized Amity project and a configured model.
-
-```powershell
-echocli config host "C:\path\to\amity.exe"
-echocli project add "C:\path\to\amity-host.json"
-echocli
-```
-
-Set `AMITY_HOST_CONFIG` to an existing host JSON to register its bound project on first launch. Project selection later follows the current working directory when it is inside a registered project; elsewhere Echo retains the selected project and displays the working directory. `echocli project use <id>` switches explicitly.
-
-Model profiles point at other preconfigured Amity host JSON files for the same authorized project root and ID:
-
-```powershell
-echocli model add local "C:\path\to\amity-local-model.json"
-echocli model use local
-```
-
-The Amity host remains responsible for authorization and model grants. Selecting a profile cannot grant access. A Lyra profile can be added when a compatible inference backend exists.
-
-## Use
+## Use Echo
 
 ```powershell
 echocli
 echocli "Investigate why saving fails in the inventory system."
-echocli task "Fix the inventory save failure."
-echocli task-steps .\task-plan.json
-echocli sessions
 echocli resume
+echocli sessions
 echocli status
+echocli --help
 echocli --version
-echocli update --check
-echocli review
-echocli approve --yes
+echocli update
 ```
 
-Interactive commands include `/task`, `/task-steps`, `/status`, `/review`, `/approve`, `/continue`, `/interrupt`, `/retry`, `/cancel`, `/reconcile`, `/report`, `/raw`, `/tools`, `/session new`, `/resume`, `/project`, `/model`, and `/exit`. Reopening or switching a session restores its stored conversation in the terminal. `echocli --help` gives the complete command list. Direct instructions are suitable for scripting; proposals remain pending until an explicit approval command. `echocli task` forces the host task workflow when a natural instruction is ambiguous. A `task-steps` file contains Amity's existing `{ "request": "...", "steps": [{ "id": "...", "instruction": "...", "depends_on": [] }] }` task shape.
+`echocli` opens the full-screen terminal. A quoted instruction runs once and is suitable for scripting. `echocli resume` and `echocli sessions` open the searchable conversation browser; `echocli status` shows current work. `echocli update --check` checks for a newer release without installing it.
 
-Type `/` in the interactive composer to open Echo's command menu. The list filters as you type; use Up and Down to choose, Tab to complete, Enter to select, and Esc to dismiss it without clearing your draft. `/model` and `/project` show configured profiles and registered projects. `/resume` and `echocli resume` open a searchable session browser scoped to the current working directory by default. Tab switches between CWD and all registered projects, F2 changes sort order, F3 filters by session status, Enter opens the selected conversation, and Esc returns without switching. `echocli resume <session-id>` opens a known session directly. New sessions record their starting directory; older sessions without that field appear under their registered project root.
+Inside Echo, type `/` to open the command menu. The menu filters as you type and describes each command. Use Up and Down to select, Tab to complete, Enter to choose, and Esc to dismiss it without clearing your draft.
 
-Echo stores configuration and recoverable session JSON under `%LOCALAPPDATA%\Amity\Echo` on Windows, or under the platform home/config directory elsewhere. `AMITY_ECHO_HOME` overrides that location. Session files contain Echo conversation text and links to Amity task IDs; Amity retains authoritative project context, permissions, task transcripts, and evidence. Echo redacts common credential forms before persistence. Avoid placing secrets in development instructions.
+| Command | What it does |
+| --- | --- |
+| `/help` | Show commands and their descriptions. |
+| `/model` | Choose a configured AI model. |
+| `/project` | Choose or connect an Amity project. |
+| `/sessions` | Search and reopen conversations. |
+| `/new-session` | Start a new conversation in the current project. |
+| `/status` | See what Echo is doing now. |
+| `/settings` | View and change Echo settings. |
+| `/review-changes` | Review proposed code changes and available decisions. |
+| `/cancel` | Cancel the current operation. |
+| `/exit` | Close Echo and return to the shell. |
 
-The selected model process powers conversational answers using Amity context and read-only AIP queries. Coding changes run through Amity's `task-create`, `task-run`, AIP proposal, gateway approval and execution, and task report commands. Echo surfaces host or model failures rather than reporting a change it cannot observe. A model adapter that only emits task gateway references cannot answer conversational questions; it must also implement Echo's conversational `ModelTurn` instruction contract. No remote service is included.
+Echo presents approvals and policy decisions when they are needed. You can describe coding work in ordinary language; Echo coordinates the agent and Amity workflow. If a project, model, or permission is missing, Echo explains the next step. Press Ctrl+C at the idle composer to return to the shell. During active work, Ctrl+C cancels the current operation.
+
+The conversation browser shows sessions from the current working directory by default. Tab switches between that directory and all registered projects, F2 changes sort order, F3 filters by session status, Enter opens the selected conversation, and Esc returns without switching. Reopening a conversation restores its stored messages. New sessions record their starting directory; older sessions without that field appear under their registered project root.
+
+Echo stores configuration and recoverable session JSON under `%LOCALAPPDATA%\Amity\Echo` on Windows, or under the platform home/config directory elsewhere. `AMITY_ECHO_HOME` overrides that location. Amity remains the source of truth for project context, permissions, tasks, and evidence. Echo redacts common credential forms before saving conversations; avoid placing secrets in development instructions.
+
+## Updates
+
+Windows x64 releases are published on the public [Amity Echo GitHub Releases](https://github.com/You-Know-Its-Me-Studios/Amity-Echo/releases) page. The interactive top bar shows `echocli update` when a newer Windows release is available. A failed update check does not interrupt input or display an error. `echocli --version` shows the installed version.
+
+Run `echocli update` from any directory to download the latest release, verify its size and SHA-256 checksum, check GitHub's release digest when supplied, and replace the installed executable. Restart Echo to use the new version. Development binaries under `target` must be installed through Cargo. No GitHub account or GitHub CLI is needed for versions 0.1.2 and later. Echo's local configuration and sessions are separate from the executable.
+
+For maintainers, set the new version in `Cargo.toml`, commit it on `main`, then push a matching `v<version>` tag pointing to that commit. The tag starts the Windows release workflow. It builds `echocli-x86_64-pc-windows-msvc.exe` from the tracked `Cargo.lock` and publishes that asset with its `.sha256` file. A source commit alone does not publish an update.

@@ -40,7 +40,7 @@ impl Agent<'_> {
         let instruction = instruction.trim();
         if instruction.is_empty() { return Ok(()); }
         if self.session.status == SessionStatus::WaitingApproval {
-            bail!("a proposal is awaiting review; use /review, /approve, or /cancel first");
+            bail!("A proposed change is waiting for your decision. Open /review-changes to review it, or /cancel to cancel the work.");
         }
         if self.session.agent_task && self.session.active_task.is_some()
             && matches!(&self.session.status,
@@ -277,7 +277,7 @@ impl Agent<'_> {
                 self.suspend_for_denial(denial)?;
                 return Ok(false);
             }
-            let message = format!("Amity has not accepted task completion: {}. Inspect /report and /status before continuing.", host_error(&reply));
+            let message = format!("Amity has not accepted task completion: {}. The work remains open; inspect /status for its current state.", host_error(&reply));
             self.session.set_status(SessionStatus::Interrupted);
             self.session.append_message(MessageRole::Assistant, &message);
             self.store.save(self.session)?;
@@ -405,7 +405,7 @@ impl Agent<'_> {
         if tool == "run_command" && self.config.execution.ask_before_execution {
             if !self.interactive || !self.events.request_approval(&format!("Run configured Amity command {}?", field(&action,"command_id")?))? {
                 self.session.pending_command = Some(action);
-                self.events.info("Command remains pending. Use /approve to run it through Amity.");
+                self.events.info("The command is waiting for your decision. Open /review-changes to review it.");
                 self.session.set_status(SessionStatus::WaitingApproval);
                 self.store.save(self.session)?;
                 return Ok(false);
@@ -434,7 +434,7 @@ impl Agent<'_> {
             self.events.proposal(&format!("Project policy change {change_id}"),
                 &serde_json::to_string_pretty(reply.get("result").unwrap_or(&Value::Null))?);
             if !self.interactive || !self.events.request_approval("Approve and activate this reviewed project policy change?")? {
-                self.events.info("Policy remains unchanged. Use /review and /approve if you want to activate this candidate.");
+                self.events.info("The project policy remains unchanged. Open /review-changes to review the proposed update.");
                 return Ok(false);
             }
             self.approve_policy_change(host, &request, turns, attempt)?;
@@ -451,10 +451,19 @@ impl Agent<'_> {
             self.session.pending_approval = Some(proposal_id.clone());
             self.session.set_status(SessionStatus::WaitingApproval);
             self.store.save(self.session)?;
-            self.events.proposal(&format!("File operation · {class}"), &safe_observation_string(&reply));
+            let operation_label = match field(&arguments, "operation")? {
+                "create" => "Create",
+                "modify" => "Modify",
+                _ => "Delete",
+            };
+            let approval_note = if class == "approval_required" {
+                "Amity requires your approval before applying it."
+            } else { "Amity has reviewed the proposed operation." };
+            self.events.proposal("Proposed file change",
+                &format!("{operation_label} {}. {approval_note}", field(&arguments, "path")?));
             if (self.config.execution.ask_before_execution || class == "approval_required")
                 && (!self.interactive || !self.events.request_approval("Execute the Amity-reviewed file proposal?")?) {
-                self.events.info("Proposal remains pending. Use /approve to execute it.");
+                self.events.info("The proposed change is waiting for your decision. Open /review-changes to review it.");
                 return Ok(false);
             }
             if !self.execute_agent_proposal(host, &proposal_id, class, &request, turns, attempt)? {
@@ -605,6 +614,7 @@ impl Agent<'_> {
         let denial_id = field(denial,"id")?.to_owned();
         let reason = field(denial,"reason")?.to_owned();
         self.session.pending_denial = Some(denial_id.clone());
+        self.session.set_status(SessionStatus::AwaitingUserDecision);
         self.store.save(self.session)?;
         let choices = denial.get("choices").and_then(Value::as_array)
             .map(|items| items.iter().filter_map(Value::as_str).map(str::to_owned).collect::<Vec<_>>())
@@ -617,22 +627,6 @@ impl Agent<'_> {
         }
         let Some(choice) = self.events.ask_decision(&reason, &choices)? else { return Ok(()); };
         self.apply_denial_decision(&host, &task_id, &denial_id, &choice)
-    }
-
-    pub fn decide(&mut self, choice: &str) -> Result<()> {
-        let task_id = self.session.active_task.clone().context("suspended session has no Amity task")?;
-        let host = self.host()?;
-        let response = host.agent_tool(Some(&task_id), json!({"type":"denial"}))?;
-        if response.get("ok").and_then(Value::as_bool) != Some(true) {
-            bail!("Amity could not retrieve the pending decision: {}", host_error(&response));
-        }
-        let denial = response.pointer("/result/denial").filter(|value| !value.is_null())
-            .context("Amity has no pending denial for this task")?;
-        let allowed = denial.get("choices").and_then(Value::as_array)
-            .is_some_and(|items| items.iter().any(|item| item.as_str() == Some(choice)));
-        if !allowed { bail!("{choice} is not an available decision for this denial"); }
-        let denial_id = field(denial,"id")?.to_owned();
-        self.apply_denial_decision(&host, &task_id, &denial_id, choice)
     }
 
     fn apply_denial_decision(&mut self, host: &HostClient, task_id: &str,
@@ -669,7 +663,7 @@ impl Agent<'_> {
         self.chat(&instruction)
     }
 
-    pub fn start_task_steps(&mut self, instruction: &str, steps: Value) -> Result<()> {
+    fn start_task_steps(&mut self, instruction: &str, steps: Value) -> Result<()> {
         self.session.agent_task = false;
         self.session.pending_instruction = None;
         let entries = steps.as_array().context("task steps must be an array")?;
@@ -694,7 +688,7 @@ impl Agent<'_> {
 
     pub fn advance_task(&mut self) -> Result<()> {
         if self.session.pending_policy_change.is_some() {
-            self.events.info("A reviewed project policy change awaits approval. Use /review or /approve.");
+            self.events.info("A project policy change is waiting for your decision. Open /review-changes to review it.");
             return Ok(());
         }
         if self.session.active_task.is_none() {
@@ -717,7 +711,7 @@ impl Agent<'_> {
                 return self.resolve_pending_denial();
             }
             if self.session.status == SessionStatus::WaitingApproval {
-                self.events.info("A proposal awaits review. Use /review or /approve.");
+                self.events.info("A proposed change is waiting for your decision. Open /review-changes to review it.");
                 return Ok(());
             }
             let instruction = self.session.pending_instruction.clone()
@@ -739,15 +733,15 @@ impl Agent<'_> {
                     self.suspend_task_denial(&host, &task_id)?;
                     return self.resolve_pending_denial();
                 }
-                "AwaitingObservation" => return self.review_task(&host, &before),
+                "AwaitingObservation" => return self.review_task(&host, &before, false),
                 "Interrupted" => {
                     self.session.set_status(SessionStatus::Interrupted);
                     self.store.save(self.session)?;
-                    self.events.warning("Task was interrupted. Inspect /status, then use /retry to continue.");
+                    self.events.warning("Work was interrupted. Open /status to see what happened and choose whether to resume.");
                     return Ok(());
                 }
                 "Running" => {
-                    self.events.info("Amity reports a running task. Inspect /status; if the worker is gone, use /interrupt then /retry.");
+                    self.events.info("Work is still running. Open /status to see its progress.");
                     return Ok(());
                 }
                 "Pending" => {}
@@ -834,7 +828,7 @@ impl Agent<'_> {
         Ok(())
     }
 
-    fn review_task(&mut self, host: &HostClient, status: &Value) -> Result<()> {
+    fn review_task(&mut self, host: &HostClient, status: &Value, requested_by_user: bool) -> Result<()> {
         let task_id = field(status, "task_id")?;
         let step = status["steps"].as_array().and_then(|steps| steps.iter().find(|step| step["state"] == "awaiting_observation"))
             .context("Amity task has no step awaiting observation")?;
@@ -843,8 +837,23 @@ impl Agent<'_> {
         let reference: Value = serde_json::from_str(proposal_text).context("invalid Amity gateway reference")?;
         let proposal_id = field(&reference, "gateway_proposal_id")?.to_owned();
         let proposal = host.proposal(&proposal_id)?;
+        let proposal_state = proposal.pointer("/result/proposal/details/state").and_then(Value::as_str);
+        if proposal_state == Some("EXECUTED") {
+            let reconciled = host.reconcile_step(task_id, &step_id)?;
+            if reconciled.get("state").and_then(Value::as_str) == Some("AwaitingObservation") {
+                bail!("Amity has not confirmed the completed operation. The work remains paused.");
+            }
+            self.session.pending_approval = None;
+            self.session.active_step = None;
+            self.store.save(self.session)?;
+            self.events.info("Amity confirmed the previously completed operation.");
+            return self.advance_task();
+        }
+        if proposal_state != Some("PROPOSED") {
+            bail!("This proposed change is no longer ready for approval. Amity reports {}.",
+                proposal_state.unwrap_or("an unknown state"));
+        }
         let class = proposal.pointer("/result/proposal/class").and_then(Value::as_str).unwrap_or("UNKNOWN");
-        let details = proposal.pointer("/result/proposal/details").cloned().unwrap_or(Value::Null);
         if class == "DENIED" {
             self.suspend_task_denial(host, task_id)?;
             return self.resolve_pending_denial();
@@ -855,20 +864,21 @@ impl Agent<'_> {
         self.session.append_message(MessageRole::Assistant,
             format!("Amity proposed gateway operation {proposal_id} for step {step_id}; class {class}."));
         self.store.save(self.session)?;
-        self.events.proposal(&format!("Task {task_id}, step {step_id} · {class}"), &serde_json::to_string_pretty(&details)?);
+        self.events.proposal("Proposed file change", &proposal_summary(&proposal)?);
         if !matches!(class, "PROPOSED" | "APPROVAL_REQUIRED") {
             bail!("Amity returned unknown proposal class {class}");
         }
-        if self.interactive && self.config.execution.ask_before_execution {
+        if self.interactive && (self.config.execution.ask_before_execution
+            || requested_by_user || class == "APPROVAL_REQUIRED") {
             if self.events.request_approval("Amity will execute the displayed proposal through its gateway.")? {
                 self.approve()?;
             } else {
-                self.events.info("Proposal remains pending. Use /approve after review.");
+                self.events.info("The proposed change is waiting for your decision. Open /review-changes to review it.");
             }
         } else if self.interactive && !self.config.execution.ask_before_execution && class == "PROPOSED" {
             self.approve()?;
         } else {
-            self.events.info("Proposal remains pending. Use /approve in an interactive session.");
+            self.events.info("The proposed change is waiting for a decision in an interactive Echo session.");
         }
         Ok(())
     }
@@ -880,30 +890,58 @@ impl Agent<'_> {
             if reply.get("ok").and_then(Value::as_bool) != Some(true) {
                 bail!("Amity could not review the policy candidate: {}", host_error(&reply));
             }
-            self.events.proposal(&format!("Project policy change {change_id}"),
-                &serde_json::to_string_pretty(&reply)?);
+            let view = reply.get("result").context("Amity returned no policy review")?;
+            self.events.proposal("Proposed project rule change", &policy_change_summary(view));
+            if view.get("stale").and_then(Value::as_bool) == Some(true) {
+                self.events.warning("Project rules changed since this proposal was prepared. Ask Echo to prepare a fresh proposal.");
+                return Ok(());
+            }
+            if self.interactive && self.events.request_approval("Approve and activate this project policy change?")? {
+                return self.approve();
+            }
             return Ok(());
         }
-        let task_id = self.session.active_task.clone().context("this session has no active task")?;
+        let Some(task_id) = self.session.active_task.clone() else {
+            self.events.info("There are no proposed changes to review.");
+            return Ok(());
+        };
         let host = self.host()?;
         if self.session.agent_task {
             if self.session.status == SessionStatus::AwaitingUserDecision {
                 return self.resolve_pending_denial();
             }
-            if let Some(command) = self.session.pending_command.as_ref() {
-                self.events.proposal(&format!("Task {task_id} · configured command"),
-                    &serde_json::to_string_pretty(command)?);
+            if let Some(command) = self.session.pending_command.clone() {
+                self.events.proposal("Proposed command", &command_summary(&command)?);
+                if self.interactive && self.events.request_approval("Run this command through Amity?")? {
+                    return self.approve();
+                }
                 return Ok(());
             }
-            let proposal_id = self.session.pending_approval.as_deref()
-                .context("this agent task has no pending proposal")?;
-            let proposal = host.proposal(proposal_id)?;
-            self.events.proposal(&format!("Task {task_id} · proposal {proposal_id}"),
-                &serde_json::to_string_pretty(&proposal)?);
+            let Some(proposal_id) = self.session.pending_approval.clone() else {
+                self.events.info("There are no proposed changes to review.");
+                return Ok(());
+            };
+            let proposal = host.proposal(&proposal_id)?;
+            self.events.proposal("Proposed file change", &proposal_summary(&proposal)?);
+            let state = proposal.pointer("/result/proposal/details/state").and_then(Value::as_str);
+            if !matches!(state, Some("PROPOSED" | "EXECUTED")) {
+                self.events.warning("This proposed change is no longer ready to apply.");
+                return Ok(());
+            }
+            let prompt = if state == Some("EXECUTED") {
+                "Amity already applied this change. Continue the work?"
+            } else { "Approve and apply this proposed change through Amity?" };
+            if self.interactive && self.events.request_approval(prompt)? {
+                return self.approve();
+            }
             return Ok(());
         }
         let status = host.task_status(&task_id)?;
-        self.review_task(&host, &status)
+        if status.get("state").and_then(Value::as_str) != Some("AwaitingObservation") {
+            self.events.info("There are no proposed changes to review.");
+            return Ok(());
+        }
+        self.review_task(&host, &status, true)
     }
 
     pub fn approve(&mut self) -> Result<()> {
@@ -961,14 +999,14 @@ impl Agent<'_> {
                 return self.chat(&instruction);
             }
             if proposal_state != "PROPOSED" {
-                bail!("Amity proposal is {proposal_state}; inspect /review and /raw before retrying");
+                bail!("Amity proposal is {proposal_state}. Open /review-changes to inspect the current proposal.");
             }
             let class = proposal.pointer("/result/proposal/class").and_then(Value::as_str)
                 .context("Amity proposal has no class")?;
             let class = match class {
                 "PROPOSED" => "proposed",
                 "APPROVAL_REQUIRED" => "approval_required",
-                "DENIED" => bail!("Amity denied this proposal; inspect /review"),
+                "DENIED" => bail!("Amity denied this proposal. Open /review-changes to see the decision."),
                 other => bail!("unknown Amity proposal class {other}"),
             };
             let mut turns = Vec::new();
@@ -989,7 +1027,7 @@ impl Agent<'_> {
             .context("pending Amity step is missing")?;
         let reference: Value = serde_json::from_str(field(step, "proposal")?)?;
         if step["state"] != "awaiting_observation" || field(&reference, "gateway_proposal_id")? != proposal_id {
-            bail!("proposal changed since review; run /review again");
+            bail!("The proposal changed since it was reviewed. Open /review-changes to inspect the latest version.");
         }
         let proposal = host.proposal(&proposal_id)?;
         let class = proposal.pointer("/result/proposal/class").and_then(Value::as_str).unwrap_or("UNKNOWN");
@@ -1018,13 +1056,13 @@ impl Agent<'_> {
         match field(&current, "state")? {
             "Succeeded" | "Failed" | "Cancelled" => self.finish_task_state(&host, &current)?,
             "Pending" if self.config.execution.auto_continue => self.advance_task()?,
-            "Pending" => self.events.info("Task is ready for the next step. Use /continue."),
+            "Pending" => self.events.info("Work is ready for its next step. Echo will continue when you resume this conversation."),
             "AwaitingObservation" => {
                 self.session.pending_approval = Some(proposal_id);
                 self.session.active_step = Some(step_id);
                 self.session.set_status(SessionStatus::WaitingApproval);
                 self.store.save(self.session)?;
-                self.events.warning("Gateway outcome is not recorded as complete. Inspect /status and use /reconcile if the gateway executed it.");
+                self.events.warning("Amity has not confirmed the operation outcome. Open /review-changes to inspect the current proposal and decide how to proceed.");
             }
             other => self.events.warning(&format!("Amity task is {other}; inspect /status.")),
         }
@@ -1084,88 +1122,129 @@ impl Agent<'_> {
         self.advance_task()
     }
 
-    pub fn interrupt(&mut self) -> Result<()> {
-        if self.session.agent_task {
-            self.cancel.store(true, Ordering::Relaxed);
-            self.session.set_status(SessionStatus::Interrupted);
-            self.store.save(self.session)?;
-            self.events.warning("Agent work interrupted. Use /continue to resume from the stored conversation.");
-            return Ok(());
-        }
-        let task_id = self.session.active_task.clone().context("this session has no active task")?;
-        let host = self.host()?;
-        let status = host.task_status(&task_id)?;
-        let step = status["steps"].as_array().and_then(|steps| steps.iter().find(|step| step["state"] == "running"))
-            .context("task has no running step")?;
-        let step_id = field(step, "id")?;
-        host.interrupt_step(&task_id, step_id)?;
-        self.session.active_step = Some(step_id.to_owned());
-        self.session.pending_approval = None;
-        self.session.set_status(SessionStatus::Interrupted);
-        self.store.save(self.session)?;
-        self.events.warning(&format!("Marked step {step_id} interrupted. Use /retry after confirming the prior worker is gone."));
-        Ok(())
-    }
-
-    pub fn reconcile(&mut self) -> Result<()> {
-        let task_id = self.session.active_task.clone().context("this session has no active task")?;
-        let step_id = self.session.active_step.clone().context("this session has no pending step")?;
-        let host = self.host()?;
-        let result = host.reconcile_step(&task_id, &step_id)?;
-        self.events.tool_result("Amity gateway reconciliation", &result.to_string(), true);
-        self.advance_task()
-    }
-
-    pub fn capabilities(&mut self) -> Result<()> {
-        let host = self.host()?;
-        self.events.raw(&serde_json::to_string_pretty(&host.capabilities()?)?);
-        self.events.raw(&serde_json::to_string_pretty(&host.native_discover()?)?);
-        self.events.raw(&serde_json::to_string_pretty(&host.tool_docs()?)?);
-        Ok(())
-    }
-
-    pub fn report(&mut self) -> Result<()> {
-        let task_id = self.session.active_task.as_deref().context("this session has no active task")?;
-        if self.session.agent_task {
-            let activity = self.host()?.agent_tool(Some(task_id), json!({"type":"activity"}))?;
-            if activity.get("ok").and_then(Value::as_bool) != Some(true) {
-                bail!("Amity agent activity is unavailable: {}", host_error(&activity));
-            }
-            self.events.raw(&serde_json::to_string_pretty(&activity)?);
-            return Ok(());
-        }
-        let report = self.host()?.task_report(task_id)?;
-        self.events.raw(&serde_json::to_string_pretty(&report)?);
-        Ok(())
-    }
-
     pub fn status(&mut self) -> Result<()> {
         self.events.context(&self.session.project_id, &self.session.id,
             self.session.model.as_deref().unwrap_or("default"));
-        if let Some(change_id) = self.session.pending_policy_change.as_deref() {
-            self.events.info(&format!("Project policy change {change_id} awaits approval."));
+        if self.session.pending_policy_change.is_some() {
+            self.events.info("A project policy change is waiting for your decision. Open /review-changes to inspect it.");
         }
-        if let Some(task_id) = self.session.active_task.as_deref() {
-            let status = self.host()?.task_status(task_id)?;
-            self.events.raw(&serde_json::to_string_pretty(&status)?);
-        } else if self.session.pending_policy_change.is_none() {
-            self.events.info("No active Amity task in this session.");
+        let Some(task_id) = self.session.active_task.as_deref() else {
+            if self.session.pending_policy_change.is_none() {
+                self.events.info("No work is active in this conversation.");
+            }
+            return Ok(());
+        };
+        let status = self.host()?.task_status(task_id)?;
+        let host_state = status.get("state").and_then(Value::as_str).unwrap_or("Unknown");
+        let state = if matches!(host_state, "Succeeded" | "Failed" | "Cancelled") {
+            match host_state {
+                "Succeeded" => "Completed",
+                "Failed" => "Failed",
+                _ => "Cancelled",
+            }
+        } else if self.session.status == SessionStatus::AwaitingUserDecision
+            || host_state == "AwaitingUserDecision" {
+            "Waiting for your decision about a policy restriction"
+        } else if self.session.pending_approval.is_some() || self.session.pending_command.is_some()
+            || host_state == "AwaitingObservation" {
+            "Waiting for your review of a proposed change"
+        } else if self.session.status == SessionStatus::Interrupted || host_state == "Interrupted" {
+            "Interrupted"
+        } else {
+            match host_state {
+                "Running" => "Working",
+                "Pending" => "Ready to continue",
+                "Succeeded" => "Completed",
+                "Failed" => "Failed",
+                "Cancelled" => "Cancelled",
+                _ => "State unavailable",
+            }
+        };
+        self.events.info(&format!("Current work: {state}."));
+        if let Some(steps) = status.get("steps").and_then(Value::as_array) {
+            if !steps.is_empty() {
+                let completed = steps.iter().filter(|step| matches!(step.get("state").and_then(Value::as_str),
+                    Some("succeeded" | "completed"))).count();
+                self.events.info(&format!("Progress: {completed} of {} steps completed.", steps.len()));
+                if let Some(step) = steps.iter().find(|step| matches!(step.get("state").and_then(Value::as_str),
+                    Some("running" | "pending" | "awaiting_observation" | "interrupted" | "failed"))) {
+                    if let Some(instruction) = step.get("instruction").and_then(Value::as_str) {
+                        let summary = redact_credentials(instruction).chars().take(140).collect::<String>();
+                        self.events.info(&format!("Current step: {summary}"));
+                    }
+                    if let Some(error) = step.get("last_error").and_then(Value::as_str) {
+                        self.events.warning(&redact_credentials(error));
+                    }
+                }
+            }
+        }
+        if state == "Waiting for your decision about a policy restriction" && self.interactive {
+            return self.resolve_pending_denial();
+        }
+        if state == "Interrupted" && self.interactive
+            && self.events.request_approval("Resume this interrupted work?")? {
+            return self.retry();
         }
         Ok(())
     }
 
-    pub fn raw(&mut self) -> Result<()> {
-        let task_id = self.session.active_task.as_deref().context("this session has no active task")?;
-        let host = self.host()?;
-        self.events.raw(&serde_json::to_string_pretty(&host.task_status(task_id)?)?);
-        if self.session.agent_task {
-            self.events.raw(&serde_json::to_string_pretty(&host.agent_tool(Some(task_id),
-                json!({"type":"activity"}))?)?);
-            return Ok(());
+}
+
+fn proposal_summary(proposal: &Value) -> Result<String> {
+    let details = proposal.pointer("/result/proposal/details")
+        .context("Amity returned no details for this proposed change")?;
+    let operation = field(details, "operation")?;
+    let resource = field(details, "resource")?;
+    let mut parts = resource.splitn(3, ':');
+    let _project = parts.next();
+    let adapter = parts.next();
+    let locator = parts.next();
+    let target = if adapter == Some("fs") { locator.unwrap_or(resource) } else { resource };
+    let verb = match operation {
+        "create" => "Create",
+        "modify" => "Modify",
+        "delete" => "Delete",
+        other => bail!("Amity returned an unknown proposed operation: {other}"),
+    };
+    let mut lines = vec![format!("{verb} {target}")];
+    if let Some(old_size) = details.get("base_byte_length").and_then(Value::as_u64) {
+        if let Some(new_size) = details.get("new_byte_length").and_then(Value::as_u64) {
+            lines.push(format!("File size: {old_size} → {new_size} bytes"));
         }
-        self.events.raw(&serde_json::to_string_pretty(&host.task_transcript(task_id)?)?);
-        Ok(())
     }
+    if proposal.pointer("/result/proposal/class").and_then(Value::as_str) == Some("APPROVAL_REQUIRED") {
+        lines.push("Amity requires your approval before applying this change.".into());
+    }
+    lines.push("Amity does not include the proposed file text in its review response.".into());
+    Ok(lines.join("\n"))
+}
+
+fn command_summary(command: &Value) -> Result<String> {
+    let id = field(command, "command_id")?;
+    let paths = command.get("paths").and_then(Value::as_array)
+        .map(|items| items.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let scope = if paths.is_empty() { "Current project".to_owned() }
+        else { format!("Paths: {}", paths.join(", ")) };
+    Ok(format!("Run configured command: {id}\n{scope}\nAmity will check the active project rules before execution."))
+}
+
+fn policy_change_summary(review: &Value) -> String {
+    let mut lines = vec!["Update the project's saved development rules.".to_owned()];
+    if let Some(count) = review.get("review_change_count").and_then(Value::as_u64) {
+        lines.push(format!("Amity reviewed {count} change(s)."));
+    }
+    if let Some(changes) = review.get("policy_changes").and_then(Value::as_array) {
+        for change in changes.iter().filter_map(Value::as_str) {
+            lines.push(format!("Rule: {change}"));
+        }
+    }
+    if let Some(notices) = review.get("notices").and_then(Value::as_array) {
+        for notice in notices.iter().filter_map(Value::as_str) {
+            lines.push(format!("Review note: {notice}"));
+        }
+    }
+    lines.join("\n")
 }
 
 fn redact_observation_strings(value: &mut Value) {
