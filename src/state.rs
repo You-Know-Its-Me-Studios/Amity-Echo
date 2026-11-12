@@ -17,6 +17,10 @@ pub struct Session {
     #[serde(default)]
     pub working_directory: Option<PathBuf>,
     pub model: Option<String>,
+    #[serde(default)]
+    pub cadenza_model: Option<crate::cadenza::ModelSelection>,
+    #[serde(default)]
+    pub model_history: Vec<ModelChange>,
     pub created_at_ms: u128,
     pub updated_at_ms: u128,
     pub status: SessionStatus,
@@ -62,12 +66,21 @@ pub struct Session {
 }
 
 impl Session {
+    pub fn select_cadenza_model(&mut self, model: crate::cadenza::ModelSelection) {
+        if self.model_history.is_empty() {
+            if let Some(previous)=&self.model { self.model_history.push(ModelChange {message_index:0,label:previous.clone(),root:self.cadenza_model.as_ref().map(|m|m.root.clone())}); }
+        }
+        self.model_history.push(ModelChange {message_index:self.messages.len(),label:model.label(),root:Some(model.root.clone())});
+        self.model=Some(model.label()); self.context_window=model.context_window(); self.last_input_tokens=None;
+        self.cadenza_model=Some(model); self.updated_at_ms=now_ms();
+    }
     pub fn append_message(&mut self, role: MessageRole, content: impl AsRef<str>) {
         self.messages.push(Message {
-            role,
+            role: role.clone(),
             content: redact_credentials(content.as_ref()),
             created_at_ms: now_ms(),
             attachments: Vec::new(),
+            model_root: if role == MessageRole::Assistant { self.cadenza_model.as_ref().map(|m|m.root.clone()) } else {None},
         });
         self.updated_at_ms = now_ms();
     }
@@ -108,7 +121,12 @@ pub struct Message {
     pub created_at_ms: u128,
     #[serde(default)]
     pub attachments: Vec<AttachmentRef>,
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    pub model_root: Option<String>,
 }
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ModelChange {pub message_index:usize,pub label:String,pub root:Option<String>}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -124,7 +142,7 @@ impl SessionStore {
         Ok(Self { dir: config.session_dir.clone() })
     }
 
-    pub fn create(&self, project_id: &str, model: Option<String>) -> io::Result<Session> {
+    pub fn create(&self, project_id: &str, model: Option<crate::cadenza::ModelSelection>) -> io::Result<Session> {
         if project_id.trim().is_empty() {
             return Err(invalid("session project ID cannot be empty"));
         }
@@ -132,7 +150,8 @@ impl SessionStore {
         let cwd = std::env::current_dir()?;
         let working_directory = Some(cwd.canonicalize().unwrap_or(cwd));
         let session = Session {
-            id: new_id(), project_id: project_id.to_owned(), working_directory, model,
+            id: new_id(), project_id: project_id.to_owned(), working_directory, model:model.as_ref().map(|m|m.label()),
+            cadenza_model:model,model_history:Vec::new(),
             created_at_ms: now, updated_at_ms: now,
             status: SessionStatus::Idle, messages: Vec::new(), task_ids: Vec::new(),
             active_task: None, active_step: None, pending_approval: None,
@@ -318,7 +337,7 @@ pub(crate) fn redact_credentials(text: &str) -> String {
     let mut output = String::new();
     for line in text.split_inclusive('\n') {
         let lower = line.to_ascii_lowercase();
-        let sensitive_assignment = ["amity_host_token=", "amity_host_token:", "authorization: bearer ",
+        let sensitive_assignment = ["amity_host_token=", "amity_host_token:", "cadenza_api_token=", "cadenza_api_token:", "authorization: bearer ",
             "api_key=", "api_key:", "api-key=", "api-key:", "access_token=", "access_token:",
             "refresh_token=", "refresh_token:", "client_secret=", "client_secret:",
             "password=", "password:"];
@@ -353,4 +372,25 @@ fn redact_inline_tokens(line: &str) -> String {
         rest = &tail[token_len..];
     }
     output
+}
+
+#[cfg(test)]
+mod cadenza_tests {
+    use super::*;
+    #[test] fn historical_sessions_and_model_changes_preserve_messages(){
+        let dir=tempfile::tempdir().unwrap();let mut config=Config::default();config.session_dir=dir.path().join("sessions");
+        let store=SessionStore::new(&config).unwrap();let mut session=store.create("project",None).unwrap();
+        session.model=Some("previous model".into());session.append_message(MessageRole::User,"original question");session.append_message(MessageRole::Assistant,"original answer");
+        let before=serde_json::to_value(&session.messages).unwrap();
+        let mut legacy=serde_json::to_value(&session).unwrap();legacy.as_object_mut().unwrap().remove("cadenza_model");legacy.as_object_mut().unwrap().remove("model_history");
+        let mut restored:Session=serde_json::from_value(legacy).unwrap();
+        let selected=crate::cadenza::ModelSelection::from_discovery(serde_json::json!({"identity":{"id":"new.family","version":"2"},"root":"a".repeat(64),"ready":true,"max_context":2048})).unwrap();
+        restored.select_cadenza_model(selected.clone());store.save(&restored).unwrap();
+        let loaded=store.load(&session.id).unwrap();assert_eq!(serde_json::to_value(&loaded.messages).unwrap(),before);
+        assert_eq!(loaded.cadenza_model.unwrap(),selected);assert_eq!(loaded.model_history[0].label,"previous model");assert_eq!(loaded.model_history[1].message_index,2);
+        restored.append_message(MessageRole::Assistant,"new output");assert_eq!(restored.messages[2].model_root.as_deref(),Some("a".repeat(64).as_str()));
+    }
+    #[test] fn cadenza_credential_is_redacted(){
+        assert_eq!(redact_credentials("CADENZA_API_TOKEN=private-value"),"[redacted credential]");
+    }
 }

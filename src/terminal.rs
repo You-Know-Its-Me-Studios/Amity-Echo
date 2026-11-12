@@ -378,6 +378,67 @@ impl Terminal {
     }
 
     /// Choose a real action without requiring the user to remember its ID.
+    pub fn wait_for_work<T:Send+'static>(&mut self,work:impl FnOnce()->Result<T>+Send+'static)->Result<T> {
+        let worker=std::thread::spawn(work);
+        self.begin_busy()?; let mut cancelled=false;
+        while !worker.is_finished() {
+            match self.poll_busy() {
+                Some(crate::events::BusyInput::Cancel)=>cancelled=true,
+                Some(crate::events::BusyInput::Message(message))=>{
+                    if let Some(screen)=&self.screen {let mut s=screen.borrow_mut();s.input=message;s.cursor=s.input.chars().count();}
+                },None=>{},
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        self.end_busy()?;
+        let result=worker.join().map_err(|_|anyhow::anyhow!("Cadenza connection worker failed"))?;
+        if cancelled {anyhow::bail!("Cadenza connection cancelled; settings unchanged");} result
+    }
+
+    pub fn choose_model(&mut self,models:&[crate::cadenza::ModelSelection],initial:usize,current:Option<&str>)->Result<Option<usize>> {
+        if self.screen.is_none(){anyhow::bail!("Open Echo's interactive terminal to choose a Cadenza model");}
+        if models.is_empty(){return Ok(None);}
+        terminal::enable_raw_mode()?;
+        self.screen.as_ref().unwrap().borrow_mut().raw=true;
+        let result=(||->Result<Option<usize>> {
+            let mut selected=initial.min(models.len()-1);let mut detail_scroll=0usize;
+            loop {
+                self.draw_model_picker(models,selected,current,detail_scroll)?;
+                match event::read()? {
+                    Event::Resize(_,_)=>{},
+                    Event::Key(key) if key.kind!=KeyEventKind::Release=>match key.code {
+                        KeyCode::Esc=>return Ok(None),
+                        KeyCode::Char('c'|'d') if key.modifiers.contains(KeyModifiers::CONTROL)=>return Ok(None),
+                        KeyCode::Enter if terminal::size().is_ok_and(|(w,h)|w>=30 && h>=12)=>return Ok(Some(selected)),
+                        KeyCode::Up=>{selected=selected.saturating_sub(1);detail_scroll=0;},
+                        KeyCode::Down=>{selected=(selected+1).min(models.len()-1);detail_scroll=0;},
+                        KeyCode::PageUp=>detail_scroll=detail_scroll.saturating_sub(5),
+                        KeyCode::PageDown=>detail_scroll=detail_scroll.saturating_add(5),
+                        _=>{},
+                    },_=>{},
+                }
+            }
+        })();
+        let restore=terminal::disable_raw_mode();
+        if restore.is_ok(){self.screen.as_ref().unwrap().borrow_mut().raw=false;}
+        restore?; self.draw()?;result
+    }
+    fn draw_model_picker(&self,models:&[crate::cadenza::ModelSelection],selected:usize,current:Option<&str>,scroll:usize)->Result<()> {
+        let (width,height)=terminal::size()?;let w=usize::from(width);let h=usize::from(height);let mut out=io::stdout();
+        queue!(out,MoveTo(0,0),Clear(ClearType::All))?;
+        self.at(&mut out,0,0,w," AMITY ECHO / Cadenza models",Tone::Brand)?;
+        if w<30 || h<12 {if h>1{self.at(&mut out,0,1,w," Enlarge the terminal to choose a model",Tone::Warning)?;}out.flush()?;return Ok(());}
+        let rows=((h-7)/2).max(1);let first=selected.saturating_sub(rows-1).min(models.len().saturating_sub(rows));
+        for (offset,m) in models.iter().enumerate().skip(first).take(rows) {
+            let label=format!("{} {}{} · {}",if offset==selected{"›"}else{" "},m.label(),if current==Some(m.root.as_str()){" [current]"}else{""},if m.ready(){"Ready"}else{"Not ready"});
+            self.at(&mut out,1,(2+offset-first)as u16,w-2,&label,if offset==selected{Tone::Brand}else{Tone::Info})?;
+        }
+        let start=3+rows;let detail=wrap(&Self::clean(&models[selected].details()),w-2);let available=h.saturating_sub(start+2);
+        let first_detail=scroll.min(detail.len().saturating_sub(available));
+        for (i,line) in detail.iter().skip(first_detail).take(available).enumerate(){self.at(&mut out,1,(start+i)as u16,w-2,line,Tone::Info)?;}
+        self.at(&mut out,1,height-1,w-2,"↑↓ choose · Enter select · Esc cancel · PgUp/PgDn details",Tone::Muted)?;out.flush()?;Ok(())
+    }
+
     pub fn choose_option(&mut self, title: &str, options: &[MenuChoice]) -> Result<Option<usize>> {
         if options.is_empty() { return Ok(None); }
         if self.screen.is_none() {
@@ -1518,13 +1579,13 @@ impl AgentEventSink for Terminal {
                     self.plain_stream_chars = 0;
                 }
             }
-            AgentEvent::ModelDelta { text } => {
+            AgentEvent::ModelText { text } => {
                 if let Some(screen) = &self.screen {
                     let mut screen = screen.borrow_mut();
                     if screen.stream_start.is_none() { screen.stream_start = Some(screen.lines.len()); }
                     let start = screen.stream_start.unwrap_or(screen.lines.len());
                     screen.lines.truncate(start);
-                    screen.stream_buffer.push_str(&text);
+                    screen.stream_buffer = text.clone();
                     if screen.stream_buffer.len() > 32 * 1024 {
                         screen.stream_buffer = screen.stream_buffer.chars().rev()
                             .take(32 * 1024).collect::<String>().chars().rev().collect();

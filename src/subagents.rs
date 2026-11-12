@@ -101,6 +101,7 @@ fn run_worker(model: &ChatModel, host: &HostClient, task: &Subtask,
         })?;
         match turn {
             ModelTurn::FinalProposal { proposal } => return Ok(proposal),
+            ModelTurn::Text {text} => return Ok(text),
             ModelTurn::ToolRequest { tool, arguments } => {
                 let action = match tool.as_str() {
                     "read_file" => json!({"type":"read","path":required(&arguments,"path")?}),

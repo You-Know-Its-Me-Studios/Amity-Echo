@@ -208,6 +208,7 @@ fn score(expected: Expected, turn: ModelTurn) -> (bool, Value) {
                 json!({"kind":"final_proposal","source_change":source_change,
                     "runtime_verified":runtime_verified,"tests_passed":tests_passed}))
         }
+        (_, ModelTurn::Text {..}) => (false,json!({"kind":"text","structured_protocol_supported":false})),
         (_, ModelTurn::ToolRequest { tool, .. }) => (false,
             json!({"kind":"tool_request","tool":tool})),
         (_, ModelTurn::AipRequest { .. }) => (false,

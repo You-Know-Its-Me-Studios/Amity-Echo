@@ -42,8 +42,9 @@ impl JsonSink {
 
 impl AgentEventSink for JsonSink {
     fn emit(&mut self, event: AgentEvent) {
-        if let AgentEvent::ModelDelta { text } = &event {
-            self.record(json!({"type":"model_progress","characters":text.chars().count()}));
+        if let AgentEvent::ModelText { text } = &event {
+            let end=text.rfind(char::is_whitespace).map(|i|i+text[i..].chars().next().map(char::len_utf8).unwrap_or(0)).unwrap_or(0);
+            self.record(json!({"type":"model_text","text":crate::state::redact_credentials(&text[..end]),"cumulative":true,"characters":text.chars().count()}));
             return;
         }
         let mut event = event;

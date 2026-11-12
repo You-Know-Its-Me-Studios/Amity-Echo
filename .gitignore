@@ -1,4 +1,5 @@
 /target/
+/artifacts/
 /.amity-echo/
 *.tmp-*
 /editor/vscode/node_modules/

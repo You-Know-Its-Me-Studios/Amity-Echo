@@ -480,13 +480,12 @@ fn workforce(ctx: &mut CapabilityContext<'_>, action: &str, input: &Value) -> Re
             bail!("worker dependencies must be an array of job names");
         }
         if job.get("model").is_some_and(|value| !value.is_string()) {
-            bail!("worker model must be a configured model profile name");
+            bail!("worker model must be a Cadenza model root");
         }
         if let Some(model_name) = job.get("model").and_then(Value::as_str) {
-            let project = ctx.config.projects.iter().find(|project| project.id == ctx.session.project_id)
-                .context("workforce project is no longer registered")?;
-            if !project.models.iter().any(|model| model.name == model_name) {
-                bail!("worker model profile {model_name} is not configured for this project");
+            let mut client=crate::cadenza::Client::connect(&ctx.config.cadenza)?;
+            if !client.discover()?.iter().any(|m|m.root==model_name && m.ready()) {
+                bail!("worker Cadenza model root is unavailable: {model_name}");
             }
         }
         let dependencies = job.get("depends_on").and_then(Value::as_array).cloned().unwrap_or_default();
@@ -553,15 +552,12 @@ fn workforce(ctx: &mut CapabilityContext<'_>, action: &str, input: &Value) -> Re
         }
         for (model_name, tasks) in groups {
             let selected = if model_name.is_empty() { None } else {
-                let mut project = ctx.config.projects.iter().find(|project|
-                    project.id == ctx.session.project_id).cloned()
-                    .context("workforce project is no longer registered")?;
-                project.select_model(Some(&model_name))?;
-                let path = project.effective_host_config()?.to_path_buf();
-                let host = HostClient::new(ctx.config.host_executable.clone(), path.clone(),
-                    Duration::from_secs(ctx.config.resources.host_timeout_seconds))?
-                    .with_token_file(project.token_file.clone());
-                let model = ChatModel::open(&project, &path, Duration::from_secs(120))?;
+                let project = ctx.config.projects.iter().find(|p|p.id==ctx.session.project_id).context("workforce project is no longer registered")?;
+                let path=project.effective_host_config()?.to_path_buf();
+                let host=HostClient::new(ctx.config.host_executable.clone(),path,Duration::from_secs(ctx.config.resources.host_timeout_seconds))?.with_token_file(project.token_file.clone());
+                let mut client=crate::cadenza::Client::connect(&ctx.config.cadenza)?;
+                let selected=client.discover()?.into_iter().find(|m|m.root==model_name && m.ready()).context("worker Cadenza model is unavailable")?;
+                let model=ChatModel::open(ctx.config,Some(&selected),Duration::from_secs(ctx.config.cadenza.request_timeout_seconds))?;
                 Some((host, model))
             };
             let (host, model) = selected.as_ref().map(|(host, model)| (host, model))

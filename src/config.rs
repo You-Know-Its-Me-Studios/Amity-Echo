@@ -16,6 +16,7 @@ pub struct Config {
     pub resources: ResourceSettings,
     #[serde(default)]
     pub capabilities: serde_json::Value,
+    pub cadenza: CadenzaSettings,
 }
 
 impl Default for Config {
@@ -30,6 +31,7 @@ impl Default for Config {
             execution: ExecutionSettings::default(),
             resources: ResourceSettings::default(),
             capabilities: serde_json::json!({}),
+            cadenza: CadenzaSettings::default(),
         }
     }
 }
@@ -43,10 +45,6 @@ pub struct ProjectRegistration {
     pub host_config: Option<PathBuf>,
     #[serde(default)]
     pub token_file: Option<PathBuf>,
-    #[serde(default)]
-    pub models: Vec<ModelProfile>,
-    #[serde(default)]
-    pub selected_model: Option<String>,
 }
 
 impl ProjectRegistration {
@@ -55,47 +53,26 @@ impl ProjectRegistration {
             "Amity is not initialized for this workspace ({}). Run /init here to enable governed coding operations",
             self.path.display()
         )))?;
-        let path = match self.selected_model.as_deref() {
-            Some(name) => self.models.iter().find(|model| model.name == name)
-                .map(|model| model.host_config.as_path())
-                .ok_or_else(|| invalid(format!("model profile '{name}' is not configured for {}", self.name))),
-            None => Ok(base),
-        }?;
-        canonical_host_config(path, &self.id, &self.path)?;
-        Ok(path)
-    }
-
-    pub fn select_model(&mut self, name: Option<&str>) -> io::Result<()> {
-        if let Some(name) = name {
-            if !self.models.iter().any(|model| model.name == name) {
-                return Err(invalid(format!("model profile '{name}' is not configured for {}", self.name)));
-            }
-        }
-        self.selected_model = name.map(str::to_owned);
-        Ok(())
-    }
-
-    pub fn add_model(&mut self, name: &str, host_config: impl AsRef<Path>) -> io::Result<()> {
-        if name.trim().is_empty() {
-            return Err(invalid("model profile name cannot be empty"));
-        }
-        let host_config = canonical_host_config(host_config.as_ref(), &self.id, &self.path)?;
-        if let Some(existing) = self.models.iter_mut().find(|model| model.name == name) {
-            existing.host_config = host_config;
-        } else {
-            self.models.push(ModelProfile { name: name.to_owned(), host_config,
-                supports_images: false });
-        }
-        Ok(())
+        canonical_host_config(base, &self.id, &self.path)?;
+        Ok(base)
     }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ModelProfile {
-    pub name: String,
-    pub host_config: PathBuf,
-    #[serde(default)]
-    pub supports_images: bool,
+#[serde(default)]
+pub struct CadenzaSettings {
+    pub endpoint: String,
+    pub credential_ref: String,
+    pub default_model: Option<crate::cadenza::ModelSelection>,
+    pub connect_timeout_seconds: u64,
+    pub request_timeout_seconds: u64,
+    pub max_tokens: u16,
+}
+impl Default for CadenzaSettings {
+    fn default() -> Self {
+        Self {endpoint:"ws://127.0.0.1:7941/cadenza".into(),credential_ref:"env:CADENZA_API_TOKEN".into(),default_model:None,
+            connect_timeout_seconds:5,request_timeout_seconds:120,max_tokens:32}
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -166,7 +143,28 @@ impl Config {
     pub fn load() -> io::Result<Self> {
         let path = Self::path();
         match fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| invalid(format!("{}: {e}", path.display()))),
+            Ok(bytes) => {
+                let mut value: serde_json::Value=serde_json::from_slice(&bytes).map_err(|e|invalid(format!("{}: {e}",path.display())))?;
+                let legacy=value.get("projects").and_then(serde_json::Value::as_array).is_some_and(|items|items.iter().any(|p|p.get("models").is_some() || p.get("selected_model").is_some()));
+                if let Some(projects)=value.get_mut("projects").and_then(serde_json::Value::as_array_mut) {
+                    for project in projects {
+                        let selected=project.get("selected_model").and_then(serde_json::Value::as_str);
+                        let host=project.get("models").and_then(serde_json::Value::as_array).and_then(|models|models.iter().find(|m|m.get("name").and_then(serde_json::Value::as_str)==selected && selected.is_some())).and_then(|m|m.get("host_config")).cloned();
+                        if let Some(host)=host {project["host_config"]=host;}
+                    }
+                }
+                let config:Self=serde_json::from_value(value).map_err(|e|invalid(format!("{}: {e}",path.display())))?;
+                if legacy {
+                    let backup=Self::home_dir().join("config.pre-cadenza.json");
+                    match fs::OpenOptions::new().write(true).create_new(true).open(backup) {
+                        Ok(mut file)=>{use std::io::Write;file.write_all(&bytes)?;file.sync_all()?;},
+                        Err(e) if e.kind()==ErrorKind::AlreadyExists=>{},
+                        Err(e)=>return Err(e),
+                    }
+                    config.save()?;
+                }
+                Ok(config)
+            },
             Err(error) if error.kind() == ErrorKind::NotFound => Ok(Self::default()),
             Err(error) => Err(error),
         }
@@ -230,7 +228,6 @@ impl Config {
         self.projects.push(ProjectRegistration {
             id: id.clone(), name, path, host_config: None,
             token_file: None,
-            models: Vec::new(), selected_model: None,
         });
         self.active_project = Some(id.clone());
         Ok(self.projects.last().expect("workspace was registered"))
@@ -260,7 +257,6 @@ impl Config {
             self.projects.push(ProjectRegistration {
                 id: id.clone(), name, path, host_config: Some(config_path),
                 token_file: None,
-                models: Vec::new(), selected_model: None,
             });
         }
         self.active_project = Some(id.clone());
@@ -300,4 +296,17 @@ fn read_host_binding(path: &Path) -> io::Result<HostBinding> {
 
 pub(crate) fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(ErrorKind::InvalidData, message.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test] fn old_project_settings_retire_without_losing_registration(){
+        let config:Config=serde_json::from_value(serde_json::json!({"projects":[{"id":"p","name":"project","path":"C:/work","host_config":"C:/binding.json","models":[{"name":"previous","host_config":"C:/old.json"}],"selected_model":"previous"}]})).unwrap();
+        let saved=serde_json::to_value(&config).unwrap();assert_eq!(saved["projects"][0]["id"],"p");assert!(saved["projects"][0].get("models").is_none());assert!(saved["projects"][0].get("selected_model").is_none());assert_eq!(config.cadenza.endpoint,"ws://127.0.0.1:7941/cadenza");
+    }
+    #[test] fn global_model_configuration_is_independent_of_projects(){
+        let mut config=Config::default();config.cadenza.endpoint="wss://inference.example.com/cadenza".into();config.cadenza.credential_ref="windows:Amity/Echo/Cadenza/default".into();
+        let saved=serde_json::to_vec(&config).unwrap();let restored:Config=serde_json::from_slice(&saved).unwrap();assert_eq!(restored.cadenza.endpoint,config.cadenza.endpoint);assert_eq!(restored.cadenza.credential_ref,config.cadenza.credential_ref);assert!(restored.projects.is_empty());
+    }
 }

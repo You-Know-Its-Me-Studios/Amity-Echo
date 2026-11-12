@@ -65,6 +65,7 @@ pub struct HostClient {
     token_file: Option<PathBuf>,
     timeout: Duration,
     max_output_bytes: usize,
+    native_model: Option<crate::cadenza::ModelSelection>,
 }
 
 /// A short-lived host config that binds AIP reads to the model actor already
@@ -91,13 +92,14 @@ impl HostClient {
             return Err(HostError::Configuration("Amity command timeout must be positive".into()));
         }
         Ok(Self { executable, config_path, token_file: None, timeout,
-            max_output_bytes: DEFAULT_OUTPUT_LIMIT })
+            max_output_bytes: DEFAULT_OUTPUT_LIMIT, native_model:None })
     }
 
     pub fn with_token_file(mut self, token_file: Option<PathBuf>) -> Self {
         self.token_file = token_file;
         self
     }
+    pub fn with_native_model(mut self,model:Option<crate::cadenza::ModelSelection>)->Self {self.native_model=model;self}
 
     pub fn with_max_output_bytes(mut self, bytes: usize) -> Result<Self, HostError> {
         if bytes == 0 {
@@ -144,6 +146,7 @@ impl HostClient {
         let mut client = Self::new(self.executable.clone(), path.clone(), self.timeout)?;
         client.max_output_bytes = self.max_output_bytes;
         client.token_file = self.token_file.clone();
+        client.native_model = self.native_model.clone();
         Ok(ModelScopedHost { client, config_path: path })
     }
 
@@ -171,23 +174,33 @@ impl HostClient {
             return Err(HostError::Configuration("AMITY_HOST_TOKEN is empty".into()));
         }
         let mut process = Command::new(&self.executable);
-        process.arg(command).arg(&self.config_path).args(args)
-            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
-            .env_clear().env("AMITY_HOST_TOKEN", &token);
-        if let Ok(bytes) = fs::read(&self.config_path) {
-            if let Ok(binding) = serde_json::from_slice::<Value>(&bytes) {
-                if let Some(model_args) = binding.get("model_args").and_then(Value::as_array) {
-                    if model_args.first().and_then(Value::as_str) == Some("__model_bridge")
-                        && model_args.get(1).and_then(Value::as_str) == Some("api_chat") {
-                        if let Some(name) = model_args.get(4).and_then(Value::as_str) {
-                            if crate::bridge::validate_key_env(name).is_ok() {
-                                if let Ok(value) = std::env::var(name) { process.env(name, value); }
-                            }
-                        }
-                    }
-                }
+        // Amity retains its model-stdio contract. Its only inference callback is
+        // this executable's native Cadenza adapter, never a stored legacy command.
+        let mut native_binding=None;
+        let mut credential=None;
+        if command=="task-run" {
+            let config=crate::config::Config::load().map_err(|_|HostError::Configuration("Could not load global Cadenza settings".into()))?;
+            let selected=self.native_model.as_ref().or(config.cadenza.default_model.as_ref()).ok_or_else(||HostError::Configuration("Choose a Cadenza model with /model before running an Amity task".into()))?;
+            let bytes=fs::read(&self.config_path).map_err(|e|HostError::Configuration(e.to_string()))?;
+            let mut binding:Value=serde_json::from_slice(&bytes).map_err(|e|HostError::Configuration(e.to_string()))?;
+            let fields=binding.as_object_mut().ok_or_else(||HostError::Configuration("Invalid Amity binding".into()))?;
+            fields.insert("model_command".into(),json!(std::env::current_exe().map_err(|e|HostError::Configuration(e.to_string()))?));
+            fields.insert("model_args".into(),json!(["__cadenza_turn",selected.root]));
+            fields.insert("model_version".into(),json!(selected.root));
+            let file=tempfile::NamedTempFile::new().map_err(|e|HostError::Configuration(e.to_string()))?;
+            serde_json::to_writer(&file,&binding).map_err(|e|HostError::Configuration(e.to_string()))?;
+            native_binding=Some(file);
+            if let Some(name)=config.cadenza.credential_ref.strip_prefix("env:") {
+                crate::credentials::validate_env(name).map_err(|e|HostError::Configuration(e.to_string()))?;
+                let secret=crate::credentials::resolve(&config.cadenza.credential_ref).map_err(|e|HostError::Configuration(e.to_string()))?;
+                credential=Some((name.to_owned(),secret));
             }
         }
+        process.arg(command).arg(native_binding.as_ref().map(|f|f.path()).unwrap_or(&self.config_path)).args(args)
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+            .env_clear().env("AMITY_HOST_TOKEN", &token);
+        if let Some((name,secret))=&credential {process.env(name,secret);}
+        if let Some(home)=std::env::var_os("AMITY_ECHO_HOME") {process.env("AMITY_ECHO_HOME",home);}
         // Windows process creation and temporary files can require these
         // operating-system variables. Other inherited credentials are omitted.
         for name in ["SystemRoot", "WINDIR", "TEMP", "TMP", "PATH",
@@ -412,6 +425,30 @@ impl HostClient {
 fn aip_request(body: Value) -> Value {
     let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
     json!({"schema":"amity.aip.v1","request_id":format!("echo:{}:{stamp}",std::process::id()),"request":body})
+}
+
+#[cfg(test)]
+mod cadenza_tests {
+    use super::*;
+    #[test]
+    #[ignore="Requires an isolated Echo /init workspace and real Amity host"]
+    fn real_amity_permissions_remain_enforced(){
+        let config=crate::config::Config::load().unwrap();let project=config.active_project().unwrap();
+        let host=HostClient::new(config.host_executable.clone(),project.effective_host_config().unwrap().to_path_buf(),Duration::from_secs(30)).unwrap().with_token_file(project.token_file.clone());
+        let scoped=host.model_scope().unwrap();let read=scoped.client().agent_tool(None,json!({"type":"read","path":"safe.txt"})).unwrap();assert_eq!(read["ok"],true);
+        let capabilities=host.agent_tool(None,json!({"type":"capabilities"})).unwrap();assert_eq!(capabilities["ok"],true);
+        let policy=host.agent_tool(None,json!({"type":"policy_status"})).unwrap();assert_eq!(policy["ok"],true);
+        let source=policy.to_string();assert!(source.contains("owner_approves_files") && source.contains("project.owner"));
+        let mutation=host.agent_tool(None,json!({"type":"propose_file","operation":"create","path":"must-not-exist.txt","content":"approval required","expected_sha256":null}));
+        assert!(!mutation.as_ref().is_ok_and(|reply|reply["ok"]==true));assert!(!project.path.join("must-not-exist.txt").exists());
+        // Record the installed host's independent fresh-workspace task baseline.
+        // Never fabricate a task/context or weaken the ACL to make it pass.
+        let task=host.create_task("Inspect safe.txt and propose creating must-not-exist.txt with owner approval");
+        let task_creation_error=task.as_ref().err().map(ToString::to_string);
+        let report=json!({"governed_read":true,"capability_discovery":true,"policy_status":true,"owner_approval_rule_present":true,"mutation_without_task_rejected":true,"file_not_created":true,
+            "task_creation_passed":task.is_ok(),"task_creation_error":task_creation_error,"full_task_execution_verified":false});
+        fs::write(std::env::var_os("ECHO_AMITY_REPORT").unwrap(),serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+    }
 }
 
 fn wait_for_child(child: &mut Child, timeout: Duration, cancel: &AtomicBool, command: &str)

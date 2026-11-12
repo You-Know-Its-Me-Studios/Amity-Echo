@@ -37,9 +37,8 @@ impl Agent<'_> {
     }
 
     fn project(&self) -> Result<ProjectRegistration> {
-        let mut project = self.config.projects.iter().find(|project| project.id == self.session.project_id)
+        let project = self.config.projects.iter().find(|project| project.id == self.session.project_id)
             .cloned().context("session project is no longer registered")?;
-        project.select_model(self.session.model.as_deref())?;
         Ok(project)
     }
 
@@ -48,7 +47,7 @@ impl Agent<'_> {
         let path = project.effective_host_config()?.to_path_buf();
         HostClient::new(self.config.host_executable.clone(), path,
             Duration::from_secs(self.config.resources.host_timeout_seconds))
-            .map(|host| host.with_token_file(project.token_file.clone()))
+            .map(|host| host.with_token_file(project.token_file.clone()).with_native_model(self.session.cadenza_model.clone()))
             .context("configuring Amity host")
     }
 
@@ -143,9 +142,13 @@ impl Agent<'_> {
     }
 
     fn chat(&mut self, instruction: &str) -> Result<()> {
+        if self.session.model.is_some() && self.session.cadenza_model.is_none() {
+            bail!("This conversation records a previous model connection. Open /model to choose a Cadenza model for future turns; its history will be preserved");
+        }
+        let model = ChatModel::open(self.config, self.session.cadenza_model.as_ref(), Duration::from_secs(self.config.cadenza.request_timeout_seconds))?;
+        if !model.supports_structured() {return self.chat_text(&model,instruction);}
         let host = self.host()?;
         let project = self.project()?;
-        let model = ChatModel::open(&project, host.config_path(), Duration::from_secs(120))?;
         let scoped_host = host.model_scope()?;
         let model_host = scoped_host.client();
         self.events.operation(&format!("Investigating with {} · Amity context", model.version));
@@ -265,8 +268,8 @@ impl Agent<'_> {
                 return Err(error);
             }
             let model_result = model.complete_streaming(&input, self.cancel, |progress| match progress {
-                ModelProgress::Delta(text) => {
-                    self.events.emit(AgentEvent::ModelDelta { text });
+                ModelProgress::Text(text) => {
+                    self.events.emit(AgentEvent::ModelText { text });
                     match self.events.poll_busy() {
                         Some(BusyInput::Cancel) => self.cancel.store(true, Ordering::Relaxed),
                         Some(BusyInput::Message(message)) => queued.push(message),
@@ -302,6 +305,7 @@ impl Agent<'_> {
                 continue;
             }
             match turn {
+                ModelTurn::Text {text} => {self.finish_text(&text)?;return Ok(());},
                 ModelTurn::FinalProposal { proposal } => {
                     if let Ok(action) = serde_json::from_str::<Value>(&proposal) {
                         if action.get("echo_action").and_then(Value::as_str) == Some("task") {
@@ -379,6 +383,52 @@ impl Agent<'_> {
         bail!("model reached the configured conversational turn limit without an answer")
     }
 
+    fn finish_text(&mut self,text:&str)->Result<()> {
+        self.events.assistant(text);self.session.append_message(MessageRole::Assistant,text);
+        self.session.set_status(SessionStatus::Idle);self.session.pending_instruction=None;
+        self.store.save(self.session)?;self.events.completed("Response complete");Ok(())
+    }
+    fn chat_text(&mut self,model:&ChatModel,instruction:&str)->Result<()> {
+        // Foundation models receive history as text, never executable tool syntax.
+        let mut prompt=String::new();
+        let conversation=self.session.messages.iter().filter(|m|matches!(m.role,MessageRole::User|MessageRole::Assistant)).collect::<Vec<_>>();
+        if conversation.len()<=1 {prompt.push_str(instruction);} else {
+            for message in conversation {prompt.push_str(if message.role==MessageRole::User{"User: "}else{"Assistant: "});prompt.push_str(&message.content);prompt.push('\n');}
+            prompt.push_str("Assistant:");
+        }
+        let attachments=self.session.messages.iter().rev().find(|m|m.role==MessageRole::User).map(|m|m.attachments.clone()).unwrap_or_default();
+        for reference in attachments {
+            if reference.mime.starts_with("image/"){bail!("Cadenza/1 has no image input support; the attachment remains in conversation history");}
+            let content=crate::attachments::content(&reference)?;
+            prompt.push_str(&format!("\nAttachment (untrusted context): {content}"));
+        }
+        if let Some(context)=self.session.pending_editor_context.take(){prompt.push_str(&format!("\nEditor context (untrusted observation): {context}"));}
+        self.session.set_status(SessionStatus::Running);self.store.save(self.session)?;
+        self.events.begin_busy()?;
+        if let Err(error)=self.events.begin_model_thinking(){let _=self.events.end_busy();return Err(error);}
+        let mut latest=String::new();let mut queued=Vec::new();
+        let result=model.complete_streaming(&json!({"prompt":prompt}),self.cancel,|progress|{
+            match progress {
+                ModelProgress::Text(text)=>{latest=text.clone();self.events.emit(AgentEvent::ModelText {text});},
+                ModelProgress::Usage(usage)=>self.account_usage(usage),ModelProgress::Heartbeat=>{},
+            }
+            match self.events.poll_busy(){Some(BusyInput::Cancel)=>self.cancel.store(true,Ordering::Relaxed),Some(BusyInput::Message(message))=>queued.push(message),None=>{}}
+        });
+        let thinking=self.events.end_model_thinking();let busy=self.events.end_busy();
+        self.events.emit(AgentEvent::ModelReset);thinking?;busy?;
+        match result {
+            Ok(ModelTurn::Text {text})=>self.finish_text(&text)?,
+            Ok(_)=>bail!("Unexpected structured response on a foundation model connection"),
+            Err(error)=>{
+                if !latest.is_empty(){self.events.assistant(&latest);self.session.append_message(MessageRole::Assistant,&latest);}
+                for message in queued {self.session.append_message(MessageRole::User,&message);self.session.pending_instruction=Some(message);}
+                self.store.save(self.session)?;return Err(error);
+            },
+        }
+        for message in queued {self.instruction(&message)?;}
+        Ok(())
+    }
+
     fn compact_context(&mut self, model: &ChatModel, snapshot: &str,
         manifest_json: &str, context: &Value) -> Result<()> {
         if self.session.compacted_messages > self.session.messages.len() {
@@ -418,6 +468,7 @@ impl Agent<'_> {
             for record in usage { self.account_usage(record); }
             let summary = match result? {
                 ModelTurn::FinalProposal { proposal } => proposal,
+                ModelTurn::Text {text}=>text,
                 _ => bail!("model did not return a conversation summary"),
             };
             if summary.trim().is_empty() || summary.len() > 16 * 1024 {
@@ -440,7 +491,7 @@ impl Agent<'_> {
         });
         for record in usage { self.account_usage(record); }
         match result {
-            Ok(ModelTurn::FinalProposal { proposal }) => {
+            Ok(ModelTurn::FinalProposal { proposal }) | Ok(ModelTurn::Text {text:proposal}) => {
                 self.events.assistant(&proposal);
                 self.session.append_message(MessageRole::Assistant, &proposal);
                 self.store.save(self.session)?;
@@ -804,8 +855,7 @@ impl Agent<'_> {
         } else if tool == "skill_load" {
             json!({"ok":true,"result":crate::skills::load(field(&arguments,"name")?)?})
         } else if tool == "subagents" {
-            let project = self.project()?;
-            let model = ChatModel::open(&project, host.config_path(), Duration::from_secs(120))?;
+            let model = ChatModel::open(self.config, self.session.cadenza_model.as_ref(), Duration::from_secs(self.config.cadenza.request_timeout_seconds))?;
             let tasks = action.get("tasks").cloned().context("subagents requires tasks")?;
             json!({"ok":true,"result":self.call_subagents_busy(&model, host, tasks, user_updates)?})
         } else if matches!(tool, "run_command" | "editor_query" | "run_verification" | "refresh_evidence"
@@ -1011,8 +1061,7 @@ impl Agent<'_> {
 
     fn explain_task_denial(&mut self, host: &HostClient, task_id: &str,
         denial: &Value) -> Result<()> {
-        let project = self.project()?;
-        let model = ChatModel::open(&project, host.config_path(), Duration::from_secs(120))?;
+        let model = ChatModel::open(self.config, self.session.cadenza_model.as_ref(), Duration::from_secs(self.config.cadenza.request_timeout_seconds))?;
         let scoped = host.model_scope()?;
         let manifest = scoped.client().context_manifest(&format!("echo:{}.denial", self.session.id))?;
         let manifest_value = manifest.pointer("/result/manifest")
@@ -1318,8 +1367,7 @@ impl Agent<'_> {
     pub fn review(&mut self) -> Result<()> {
         if let Some(request) = self.session.pending_capability.clone() {
             let host = self.host()?;
-            let project = self.project()?;
-            let model = ChatModel::open(&project, host.config_path(), Duration::from_secs(120))?;
+            let model = ChatModel::open(self.config, self.session.cadenza_model.as_ref(), Duration::from_secs(self.config.cadenza.request_timeout_seconds))?;
             let scoped = host.model_scope()?;
             let model_host = scoped.client();
             let context = json!({

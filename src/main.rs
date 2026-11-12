@@ -1,6 +1,7 @@
 mod agent;
 mod attachments;
-mod bridge;
+mod cadenza;
+mod credentials;
 mod capabilities;
 mod commands;
 mod config;
@@ -63,9 +64,7 @@ fn run() -> Result<()> {
         }
         index += 1;
     }
-    if args.first().is_some_and(|argument| argument == "__model_bridge") {
-        return bridge::run(&args[1..]);
-    }
+    if args.first().is_some_and(|arg|arg=="__cadenza_turn") {return model::host_turn(&args[1..]);}
     match args.as_slice() {
         [version] if matches!(version.as_str(), "--version" | "-V") => {
             println!("Amity Echo {}", env!("CARGO_PKG_VERSION"));
@@ -201,13 +200,20 @@ fn current_session(config: &Config, store: &SessionStore) -> Result<Session> {
         .find(|session| session_matches_cwd(session, &cwd, &project.path)) {
         return Ok(session);
     }
-    store.create(&project.id, project.selected_model.clone()).map_err(Into::into)
+    store.create(&project.id, config.cadenza.default_model.clone()).map_err(Into::into)
 }
 
 fn interactive(config: &mut Config, store: &SessionStore, terminal: &mut Terminal,
     cancel: &AtomicBool, mut session: Option<Session>) -> Result<()> {
     let mut steward = StewardMonitor::new(config);
     show_session(config, terminal, session.as_ref());
+    let settings=config.cadenza.clone();let selected=session.as_ref().and_then(|s|s.cadenza_model.clone()).or(config.cadenza.default_model.clone());
+    match terminal.wait_for_work(move || {
+        let mut client=cadenza::Client::connect(&settings)?;
+        let models=client.discover()?;client.health()?;
+        if let Some(selected)=selected {let current=models.iter().find(|m|m.root==selected.root && m.identity==selected.identity && m.ready()).context("Selected Cadenza model is unavailable; open /model")?;Ok(format!("Cadenza ready · {}",current.label()))}
+        else {Ok(format!("Cadenza connected · {} available model(s). Open /model to choose the global default.",models.len()))}
+    }) {Ok(message)=>terminal.info(&message),Err(error)=>terminal.warning(&format!("Inference unavailable: {error:#}. Echo remains usable."))}
     if let Some(current) = session.as_mut() {
         resume_pending(config, store, terminal, cancel, current);
     }
@@ -280,7 +286,7 @@ fn interactive(config: &mut Config, store: &SessionStore, terminal: &mut Termina
                 Command::NewSession => {
                     (|| -> Result<()> {
                         if let Some(project) = config.active_project() {
-                            session = Some(store.create(&project.id, project.selected_model.clone())?);
+                            session = Some(store.create(&project.id, config.cadenza.default_model.clone())?);
                             show_session(config, terminal, session.as_ref());
                         } else {
                             terminal.info("Echo could not select the current working directory.");
@@ -489,132 +495,53 @@ fn select_session_project(config: &mut Config, session: &Session) -> Result<()> 
 
 fn choose_model(config: &mut Config, store: &SessionStore, terminal: &mut Terminal,
     session: &mut Session) -> Result<()> {
-    let project = active_project(config)?;
-    if project.host_config.is_none() {
-        terminal.info("This folder is already your Echo project. Run /init once to enable its Amity connection, then choose a model.");
-        return Ok(());
-    }
-    let models = project.models.clone();
-    let mut options = vec![MenuChoice {
-        command: "Project default".into(),
-        description: if session.model.is_none() { "Current model".into() }
-            else { "Use the model in this project's Amity connection".into() },
-    }];
-    for model in &models {
-        options.push(MenuChoice { command: model.name.clone(),
-            description: if session.model.as_deref() == Some(&model.name) {
-                "Current model".into()
-            } else { "Configured model".into() } });
-    }
-    options.push(MenuChoice { command: "Connect local Ollama model".into(),
-        description: "Find installed models and connect one automatically".into() });
-    options.push(MenuChoice { command: "Connect API model".into(),
-        description: "Discover models from a Chat Completions compatible API".into() });
-    options.push(MenuChoice { command: "Use an existing Amity model connection".into(),
-        description: "Select a connection JSON file already configured for this project".into() });
-    let Some(index) = terminal.choose_option("Choose an AI model", &options)? else { return Ok(()); };
-    let mut next_config = config.clone();
-    let selected = if index == options.len() - 3 {
-        let endpoint = terminal.prompt_text("Ollama address (Enter for http://127.0.0.1:11434)")?
-            .unwrap_or_default();
-        let endpoint = if endpoint.trim().is_empty() { "http://127.0.0.1:11434" }
-            else { endpoint.trim() };
-        let names = bridge::discover_ollama(endpoint)?;
-        if names.is_empty() { bail!("Ollama has no installed models. Install a model in Ollama first."); }
-        let choices = names.iter().map(|name| MenuChoice {
-            command:name.clone(), description:"Available in Ollama".into()
-        }).collect::<Vec<_>>();
-        let Some(chosen) = terminal.choose_option("Choose a local model", &choices)? else { return Ok(()); };
-        let name = names[chosen].clone();
-        let source = active_project(&next_config)?.host_config.clone()
-            .context("This workspace has no Amity model connection")?;
-        let mut binding: serde_json::Value = serde_json::from_slice(&std::fs::read(source)?)?;
-        let fields = binding.as_object_mut().context("Amity connection is not a JSON object")?;
-        fields.insert("model_command".into(), serde_json::json!(env::current_exe()?));
-        fields.insert("model_args".into(), serde_json::json!([
-            "__model_bridge", "ollama", endpoint, name
-        ]));
-        fields.insert("model_version".into(), serde_json::json!(name));
-        let digest = format!("{:x}", Sha256::digest(format!("{}:{name}",
-            active_project(&next_config)?.id).as_bytes()));
-        let path = Config::home_dir().join("connections").join(format!("{digest}.json"));
-        state::write_json_atomic(&path, &binding)?;
-        next_config.active_project_mut().context("No project is selected")?
-            .add_model(&name, &path)?;
-        if let Some(profile) = next_config.active_project_mut()
-            .and_then(|project| project.models.iter_mut().find(|profile| profile.name == name)) {
-            profile.supports_images = bridge::ollama_supports_vision(endpoint, &name).unwrap_or(false);
-        }
-        Some(name)
-    } else if index == options.len() - 2 {
-        let endpoint = terminal.prompt_text("API base URL (for example https://api.openai.com/v1)")?
-            .context("API setup cancelled")?;
-        let key_env = terminal.prompt_text("Credential environment variable (Enter for AMITY_ECHO_API_KEY)")?
-            .unwrap_or_default();
-        let key_env = if key_env.trim().is_empty() { "AMITY_ECHO_API_KEY" }
-            else { key_env.trim() };
-        bridge::validate_key_env(key_env)?;
-        let names = bridge::discover_api_models(endpoint.trim(), key_env)?;
-        if names.is_empty() { bail!("This API returned no models."); }
-        let choices = names.iter().map(|name| MenuChoice {
-            command: name.clone(), description: "Available from this API".into()
-        }).collect::<Vec<_>>();
-        let Some(chosen) = terminal.choose_option("Choose an API model", &choices)? else { return Ok(()); };
-        let model_id = names[chosen].clone();
-        let digest = format!("{:x}", Sha256::digest(format!("{}:{}:{model_id}",
-            active_project(&next_config)?.id, endpoint.trim()).as_bytes()));
-        let profile_name = format!("API: {model_id} [{}]", &digest[..8]);
-        let source = active_project(&next_config)?.host_config.clone()
-            .context("This workspace has no Amity model connection")?;
-        let mut binding: serde_json::Value = serde_json::from_slice(&std::fs::read(source)?)?;
-        let fields = binding.as_object_mut().context("Amity connection is not a JSON object")?;
-        fields.insert("model_command".into(), serde_json::json!(env::current_exe()?));
-        fields.insert("model_args".into(), serde_json::json!([
-            "__model_bridge", "api_chat", endpoint.trim(), model_id, key_env
-        ]));
-        fields.insert("model_version".into(), serde_json::json!(model_id));
-        let path = Config::home_dir().join("connections").join(format!("{digest}.json"));
-        state::write_json_atomic(&path, &binding)?;
-        next_config.active_project_mut().context("No project is selected")?
-            .add_model(&profile_name, &path)?;
-        let image_choices = [
-            MenuChoice { command: "Text only".into(),
-                description: "Use when the API model does not accept images".into() },
-            MenuChoice { command: "Images and text".into(),
-                description: "Choose only if this provider documents image input for the model".into() },
-        ];
-        if let Some(choice) = terminal.choose_option("What input does this model support?", &image_choices)? {
-            if let Some(profile) = next_config.active_project_mut()
-                .and_then(|project| project.models.iter_mut()
-                    .find(|profile| profile.name == profile_name)) {
-                profile.supports_images = choice == 1;
-            }
-        }
-        Some(profile_name)
-    } else if index == options.len() - 1 {
-        let Some(name) = terminal.prompt_text("Name for this model")? else { return Ok(()); };
-        if name.trim().is_empty() { bail!("Enter a model name."); }
-        let Some(path) = terminal.prompt_text("Path to its Amity connection JSON file")? else {
-            return Ok(());
-        };
-        if path.trim().is_empty() { bail!("Enter the connection file path."); }
-        next_config.active_project_mut().context("No project is selected")?
-            .add_model(name.trim(), path.trim().trim_matches('"'))?;
-        Some(name.trim().to_owned())
-    } else if index == 0 { None } else {
-        Some(models[index - 1].name.clone())
-    };
-    next_config.active_project_mut().context("No project is selected")?
-        .select_model(selected.as_deref())?;
-    next_config.save()?;
-    let mut next_session = session.clone();
-    next_session.model = selected.clone();
-    store.save(&next_session)?;
-    *config = next_config;
-    *session = next_session;
-    terminal.context(&session.project_id, &session.id, selected.as_deref().unwrap_or("default"));
-    terminal.info(&format!("Using {}.", selected.as_deref().unwrap_or("the project's default model")));
+    terminal.info("Connecting to Cadenza and discovering models…");
+    let settings=config.cadenza.clone();
+    let models=terminal.wait_for_work(move || {
+        let mut client=cadenza::Client::connect(&settings)?;
+        let models=client.discover()?; client.health()?; Ok(models)
+    })?;
+    if models.is_empty() { bail!("Cadenza returned no models; the existing selection was preserved"); }
+    let current=session.cadenza_model.as_ref().or(config.cadenza.default_model.as_ref());
+    let selected=current.and_then(|m|models.iter().position(|candidate|candidate.root==m.root)).unwrap_or(0);
+    let Some(index)=terminal.choose_model(&models,selected,current.map(|m|m.root.as_str()))? else {return Ok(());};
+    let candidate=models[index].clone();
+    if !candidate.ready() {bail!("This Cadenza model is not ready. The existing selection was preserved");}
+    let settings=config.cadenza.clone();let requested=candidate.clone();
+    let candidate=terminal.wait_for_work(move || {
+        let mut client=cadenza::Client::connect(&settings)?;
+        client.validate_selection(&requested)
+    })?;
+    let mut next=config.clone(); next.cadenza.default_model=Some(candidate.clone());
+    let mut next_session=session.clone(); next_session.select_cadenza_model(candidate.clone());
+    // Save both before replacing live state; restore the previous global default on session write failure.
+    next.save()?;
+    if let Err(error)=store.save(&next_session) {config.save()?; return Err(error.into());}
+    *config=next; *session=next_session;
+    terminal.context(&session.project_id,&session.id,&candidate.label());
+    terminal.info(&format!("Using {} through Cadenza. Saved as the global default.",candidate.label()));
     Ok(())
+}
+
+fn configure_cadenza(config:&mut Config,terminal:&mut Terminal)->Result<bool> {
+    let options=[MenuChoice {command:"Endpoint".into(),description:config.cadenza.endpoint.clone()},
+        MenuChoice {command:"Credential reference".into(),description:config.cadenza.credential_ref.clone()},
+        MenuChoice {command:"Store credential in Windows Credential Manager".into(),description:"Import from an environment variable; the value is never shown or saved in JSON".into()},
+        MenuChoice {command:"Maximum generated tokens".into(),description:config.cadenza.max_tokens.to_string()}];
+    let Some(choice)=terminal.choose_option("Cadenza connection",&options)? else{return Ok(false);};
+    match choice {
+        0=>if let Some(value)=terminal.prompt_text("Cadenza endpoint (ws://loopback/cadenza or wss://host/cadenza)")?{config.cadenza.endpoint=value.trim().to_owned();crate::cadenza::endpoint(&config.cadenza)?;}else{return Ok(false);},
+        1=>if let Some(value)=terminal.prompt_text("Credential reference (env:CADENZA_API_TOKEN or windows:Amity/Echo/Cadenza/default)")?{
+            let value=value.trim();if let Some(name)=value.strip_prefix("env:"){credentials::validate_env(name)?;}else if !value.starts_with("windows:Amity/Echo/Cadenza/"){bail!("Use env: or an Echo Cadenza Windows credential reference");}
+            config.cadenza.credential_ref=value.to_owned();
+        }else{return Ok(false);},
+        2=>{let Some(name)=terminal.prompt_text("Environment variable containing the credential (Enter for CADENZA_API_TOKEN)")? else{return Ok(false);};
+            credentials::store_environment(if name.trim().is_empty(){"CADENZA_API_TOKEN"}else{name.trim()},"Amity/Echo/Cadenza/default")?;
+            config.cadenza.credential_ref="windows:Amity/Echo/Cadenza/default".into();terminal.info("Credential saved in Windows Credential Manager.");},
+        3=>if let Some(value)=terminal.prompt_text("Maximum generated tokens (1..256; prompt plus output must fit the selected model)")?{
+            let count=value.trim().parse::<u16>().context("Enter an integer from 1 to 256")?;if !(1..=256).contains(&count){bail!("Enter an integer from 1 to 256");}config.cadenza.max_tokens=count;
+        }else{return Ok(false);},_=>unreachable!(),
+    }Ok(true)
 }
 
 fn choose_settings(config: &mut Config, terminal: &mut Terminal) -> Result<()> {
@@ -640,6 +567,7 @@ fn choose_settings(config: &mut Config, terminal: &mut Terminal) -> Result<()> {
                 description: "Connect or remove external development services".into() },
             MenuChoice { command: "Capabilities".into(),
                 description: "Choose which engineering features Echo can use".into() },
+            MenuChoice {command:"Cadenza connection".into(),description:config.cadenza.endpoint.clone()},
         ];
         let Some(index) = terminal.choose_option("Echo settings", &options)? else { return Ok(()); };
         let mut next = config.clone();
@@ -671,6 +599,7 @@ fn choose_settings(config: &mut Config, terminal: &mut Terminal) -> Result<()> {
             } else { changed = false; },
             8 => changed = configure_mcp(&mut next, terminal)?,
             9 => changed = configure_capabilities(&mut next, terminal)?,
+            10 => changed = configure_cadenza(&mut next, terminal)?,
             _ => unreachable!(),
         }
         if !changed { continue; }
@@ -849,26 +778,16 @@ fn configure_mcp(config: &mut Config, terminal: &mut Terminal) -> Result<bool> {
         (true, id, None)
     };
     let project = config.active_project_mut().context("No project is selected")?;
-    let mut bindings = vec![(None, project.host_config.clone()
-        .context("Amity is not configured for this workspace")?)];
-    bindings.extend(project.models.iter().enumerate()
-        .map(|(index, profile)| (Some(index), profile.host_config.clone())));
-    for (index, source) in bindings {
-        let mut binding: serde_json::Value = serde_json::from_slice(&std::fs::read(source)?)?;
-        let fields = binding.as_object_mut().context("Amity connection is not a JSON object")?;
-        let mut current = fields.get("mcp_servers").and_then(serde_json::Value::as_array)
-            .cloned().unwrap_or_default();
-        current.retain(|server| server.get("id").and_then(serde_json::Value::as_str) != Some(&id));
-        if !remove { current.push(new_server.clone().context("new server is missing")?); }
-        fields.insert("mcp_servers".into(), serde_json::Value::Array(current));
-        let label = index.map(|number| project.models[number].name.as_str()).unwrap_or("default");
-        let digest = format!("{:x}", Sha256::digest(
-            format!("{}:mcp:{label}",project.id).as_bytes()));
-        let path = Config::home_dir().join("connections").join(format!("mcp-{digest}.json"));
-        state::write_json_atomic(&path, &binding)?;
-        if let Some(index) = index { project.models[index].host_config = path; }
-        else { project.host_config = Some(path); }
-    }
+    let source=project.host_config.clone().context("Amity is not configured for this workspace")?;
+    let mut binding:serde_json::Value=serde_json::from_slice(&std::fs::read(source)?)?;
+    let fields=binding.as_object_mut().context("Amity connection is not a JSON object")?;
+    let mut current=fields.get("mcp_servers").and_then(serde_json::Value::as_array).cloned().unwrap_or_default();
+    current.retain(|server|server.get("id").and_then(serde_json::Value::as_str)!=Some(&id));
+    if !remove {current.push(new_server.clone().context("new server is missing")?);}
+    fields.insert("mcp_servers".into(),serde_json::Value::Array(current));
+    let digest=format!("{:x}",Sha256::digest(format!("{}:mcp",project.id).as_bytes()));
+    let path=Config::home_dir().join("connections").join(format!("mcp-{digest}.json"));
+    state::write_json_atomic(&path,&binding)?; project.host_config=Some(path);
     terminal.info(if remove { "MCP service removed." } else { "MCP service saved. Echo will discover its tools when needed." });
     Ok(true)
 }

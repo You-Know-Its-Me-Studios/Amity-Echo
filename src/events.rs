@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
     Assistant { message: String },
-    ModelDelta { text: String },
+    /// Complete decoded output so far; may revise an incomplete UTF-8 suffix.
+    ModelText { text: String },
     ModelReset,
     ModelUsage { input_tokens: Option<u64>, output_tokens: Option<u64>,
         context_window: Option<u64>, cost_usd: Option<f64> },

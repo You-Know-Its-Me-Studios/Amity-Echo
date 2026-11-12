@@ -297,10 +297,7 @@ pub fn availability(id: &str, mode: &str, config: &Config,
                 else { "No executable runtime observation is configured in Amity".into() } };
     }
     if id == "visual_to_code_navigation" {
-        let vision = project.is_some_and(|project| {
-            project.selected_model.as_ref().and_then(|name| project.models.iter()
-                .find(|profile| &profile.name == name)).is_some_and(|profile| profile.supports_images)
-        });
+        let vision = false; // Cadenza/1 has no image input transport.
         return Availability { status: "available", enabled, activation: activation.into(),
             execution_available: Some(vision),
             reason: if vision { "Image and editor references supported".into() }
