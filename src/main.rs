@@ -1,10 +1,16 @@
 mod agent;
+mod attachments;
+mod bridge;
 mod commands;
 mod config;
 mod events;
+mod headless;
+mod ide;
 mod host;
 mod model;
+mod skills;
 mod state;
+mod subagents;
 mod terminal;
 mod update;
 
@@ -15,19 +21,49 @@ use config::Config;
 use state::{MessageRole, Session, SessionStatus, SessionStore};
 use std::env;
 use std::path::{Path, PathBuf};
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use terminal::{Input, MenuChoice, SessionPickerEntry, Terminal};
 
 fn main() {
     if let Err(error) = run() {
-        eprintln!("echocli: {error:#}");
+        let message = state::redact_credentials(&format!("{error:#}"));
+        if env::args().any(|argument| argument == "--json") {
+            println!("{}", serde_json::json!({"type":"result","status":"failed",
+                "exit_code":1,"error":message}));
+        } else { eprintln!("echocli: {message}"); }
         std::process::exit(1);
     }
 }
 
 fn run() -> Result<()> {
-    let args: Vec<String> = env::args().skip(1).collect();
+    let raw_args: Vec<String> = env::args().skip(1).collect();
+    let mut args = Vec::new();
+    let mut json_mode = false;
+    let mut attachment_paths = Vec::new();
+    let mut editor_context_path = None;
+    let mut index = 0;
+    while index < raw_args.len() {
+        match raw_args[index].as_str() {
+            "--json" => json_mode = true,
+            "--attach" => {
+                index += 1;
+                attachment_paths.push(PathBuf::from(raw_args.get(index)
+                    .context("--attach requires a file path")?));
+            }
+            "--editor-context" => {
+                index += 1;
+                editor_context_path = Some(PathBuf::from(raw_args.get(index)
+                    .context("--editor-context requires a JSON file path")?));
+            }
+            _ => args.push(raw_args[index].clone()),
+        }
+        index += 1;
+    }
+    if args.first().is_some_and(|argument| argument == "__model_bridge") {
+        return bridge::run(&args[1..]);
+    }
     match args.as_slice() {
         [version] if matches!(version.as_str(), "--version" | "-V") => {
             println!("Amity Echo {}", env!("CARGO_PKG_VERSION"));
@@ -67,6 +103,22 @@ fn run() -> Result<()> {
     let signal = Arc::clone(&cancel);
     ctrlc::set_handler(move || { signal.store(true, Ordering::SeqCst); })
         .context("installing Ctrl+C handler")?;
+    if json_mode {
+        if args.is_empty() { bail!("Usage: echocli --json <instruction>"); }
+        let instruction = args.join(" ");
+        let mut sink = headless::JsonSink::new();
+        let mut session = current_session(&config, &store)?;
+        attach_inputs(&mut session, &store, &config, &attachment_paths,
+            editor_context_path.as_deref())?;
+        let result = {
+            let mut agent = Agent { config: &config, store: &store, session: &mut session,
+                events: &mut sink, cancel: cancel.as_ref(), interactive: false };
+            agent.instruction(&instruction)
+        };
+        let code = sink.finish(&session, result.as_ref().err())?;
+        if code != 0 { std::process::exit(code); }
+        return Ok(());
+    }
     let mut terminal = Terminal::new(Config::home_dir().join("history.txt"), config.terminal.color)?;
     if let Some(error) = registration_error {
         terminal.warning(&format!("Could not connect the project from AMITY_HOST_CONFIG: {error}"));
@@ -75,9 +127,13 @@ fn run() -> Result<()> {
     match args.as_slice() {
         [] => {
             terminal.enter_interactive(&cwd)?;
-            let session = if config.active_project().is_some() {
+            let mut session = if config.active_project().is_some() {
                 Some(current_session(&config, &store)?)
             } else { None };
+            if let Some(current) = session.as_mut() {
+                attach_inputs(current, &store, &config, &attachment_paths,
+                    editor_context_path.as_deref())?;
+            }
             interactive(&mut config, &store, &mut terminal, cancel.as_ref(), session)
         }
         [command] if command == "resume" || command == "sessions" => {
@@ -112,11 +168,26 @@ fn run() -> Result<()> {
                 bail!("No project is connected. Open `echocli`, choose /project, and connect an Amity project.");
             }
             let mut session = current_session(&config, &store)?;
+            attach_inputs(&mut session, &store, &config, &attachment_paths,
+                editor_context_path.as_deref())?;
             let mut agent = Agent { config: &config, store: &store, session: &mut session,
                 events: &mut terminal, cancel: cancel.as_ref(), interactive: false };
             agent.instruction(&instruction)
         }
     }
+}
+
+fn attach_inputs(session: &mut Session, store: &SessionStore, config: &Config,
+    files: &[PathBuf], editor_context: Option<&Path>) -> Result<()> {
+    if session.pending_attachments.len() + files.len() > 2 {
+        bail!("attach at most two files to a message");
+    }
+    for path in files { session.pending_attachments.push(attachments::attach(path)?); }
+    if let Some(path) = editor_context {
+        session.pending_editor_context = Some(ide::load(path, active_project(config)?)?);
+    }
+    if !files.is_empty() { store.save(session)?; }
+    Ok(())
 }
 
 fn active_project(config: &Config) -> Result<&config::ProjectRegistration> {
@@ -202,6 +273,23 @@ fn interactive(config: &mut Config, store: &SessionStore, terminal: &mut Termina
                         terminal.info("Connect a project with /project before choosing a model.");
                         Ok(())
                     }
+                }
+                Command::Attach => {
+                    (|| -> Result<()> {
+                        let Some(current) = session.as_mut() else {
+                            terminal.info("Connect a project with /project before attaching a file.");
+                            return Ok(());
+                        };
+                        let Some(path) = terminal.prompt_text("Image or text file to attach")? else { return Ok(()); };
+                        let reference = attachments::attach(path.trim().trim_matches('"'))?;
+                        if current.pending_attachments.len() >= 2 {
+                            bail!("attach at most two files to a message");
+                        }
+                        terminal.info(&format!("Attached {} to your next message.", reference.name));
+                        current.pending_attachments.push(reference);
+                        store.save(current)?;
+                        Ok(())
+                    })()
                 }
                 Command::Settings => choose_settings(config, terminal),
                 Command::Status => {
@@ -352,11 +440,90 @@ fn choose_model(config: &mut Config, store: &SessionStore, terminal: &mut Termin
                 "Current model".into()
             } else { "Configured model".into() } });
     }
-    options.push(MenuChoice { command: "Add a model".into(),
-        description: "Connect another model for this project".into() });
+    options.push(MenuChoice { command: "Connect local Ollama model".into(),
+        description: "Find installed models and connect one automatically".into() });
+    options.push(MenuChoice { command: "Connect API model".into(),
+        description: "Discover models from a Chat Completions compatible API".into() });
+    options.push(MenuChoice { command: "Use an existing Amity model connection".into(),
+        description: "Select a connection JSON file already configured for this project".into() });
     let Some(index) = terminal.choose_option("Choose an AI model", &options)? else { return Ok(()); };
     let mut next_config = config.clone();
-    let selected = if index == options.len() - 1 {
+    let selected = if index == options.len() - 3 {
+        let endpoint = terminal.prompt_text("Ollama address (Enter for http://127.0.0.1:11434)")?
+            .unwrap_or_default();
+        let endpoint = if endpoint.trim().is_empty() { "http://127.0.0.1:11434" }
+            else { endpoint.trim() };
+        let names = bridge::discover_ollama(endpoint)?;
+        if names.is_empty() { bail!("Ollama has no installed models. Install a model in Ollama first."); }
+        let choices = names.iter().map(|name| MenuChoice {
+            command:name.clone(), description:"Available in Ollama".into()
+        }).collect::<Vec<_>>();
+        let Some(chosen) = terminal.choose_option("Choose a local model", &choices)? else { return Ok(()); };
+        let name = names[chosen].clone();
+        let source = active_project(&next_config)?.host_config.clone();
+        let mut binding: serde_json::Value = serde_json::from_slice(&std::fs::read(source)?)?;
+        let fields = binding.as_object_mut().context("Amity connection is not a JSON object")?;
+        fields.insert("model_command".into(), serde_json::json!(env::current_exe()?));
+        fields.insert("model_args".into(), serde_json::json!([
+            "__model_bridge", "ollama", endpoint, name
+        ]));
+        fields.insert("model_version".into(), serde_json::json!(name));
+        let digest = format!("{:x}", Sha256::digest(format!("{}:{name}",
+            active_project(&next_config)?.id).as_bytes()));
+        let path = Config::home_dir().join("connections").join(format!("{digest}.json"));
+        state::write_json_atomic(&path, &binding)?;
+        next_config.active_project_mut().context("No project is selected")?
+            .add_model(&name, &path)?;
+        if let Some(profile) = next_config.active_project_mut()
+            .and_then(|project| project.models.iter_mut().find(|profile| profile.name == name)) {
+            profile.supports_images = bridge::ollama_supports_vision(endpoint, &name).unwrap_or(false);
+        }
+        Some(name)
+    } else if index == options.len() - 2 {
+        let endpoint = terminal.prompt_text("API base URL (for example https://api.openai.com/v1)")?
+            .context("API setup cancelled")?;
+        let key_env = terminal.prompt_text("Credential environment variable (Enter for AMITY_ECHO_API_KEY)")?
+            .unwrap_or_default();
+        let key_env = if key_env.trim().is_empty() { "AMITY_ECHO_API_KEY" }
+            else { key_env.trim() };
+        bridge::validate_key_env(key_env)?;
+        let names = bridge::discover_api_models(endpoint.trim(), key_env)?;
+        if names.is_empty() { bail!("This API returned no models."); }
+        let choices = names.iter().map(|name| MenuChoice {
+            command: name.clone(), description: "Available from this API".into()
+        }).collect::<Vec<_>>();
+        let Some(chosen) = terminal.choose_option("Choose an API model", &choices)? else { return Ok(()); };
+        let model_id = names[chosen].clone();
+        let digest = format!("{:x}", Sha256::digest(format!("{}:{}:{model_id}",
+            active_project(&next_config)?.id, endpoint.trim()).as_bytes()));
+        let profile_name = format!("API: {model_id} [{}]", &digest[..8]);
+        let source = active_project(&next_config)?.host_config.clone();
+        let mut binding: serde_json::Value = serde_json::from_slice(&std::fs::read(source)?)?;
+        let fields = binding.as_object_mut().context("Amity connection is not a JSON object")?;
+        fields.insert("model_command".into(), serde_json::json!(env::current_exe()?));
+        fields.insert("model_args".into(), serde_json::json!([
+            "__model_bridge", "api_chat", endpoint.trim(), model_id, key_env
+        ]));
+        fields.insert("model_version".into(), serde_json::json!(model_id));
+        let path = Config::home_dir().join("connections").join(format!("{digest}.json"));
+        state::write_json_atomic(&path, &binding)?;
+        next_config.active_project_mut().context("No project is selected")?
+            .add_model(&profile_name, &path)?;
+        let image_choices = [
+            MenuChoice { command: "Text only".into(),
+                description: "Use when the API model does not accept images".into() },
+            MenuChoice { command: "Images and text".into(),
+                description: "Choose only if this provider documents image input for the model".into() },
+        ];
+        if let Some(choice) = terminal.choose_option("What input does this model support?", &image_choices)? {
+            if let Some(profile) = next_config.active_project_mut()
+                .and_then(|project| project.models.iter_mut()
+                    .find(|profile| profile.name == profile_name)) {
+                profile.supports_images = choice == 1;
+            }
+        }
+        Some(profile_name)
+    } else if index == options.len() - 1 {
         let Some(name) = terminal.prompt_text("Name for this model")? else { return Ok(()); };
         if name.trim().is_empty() { bail!("Enter a model name."); }
         let Some(path) = terminal.prompt_text("Path to its Amity connection JSON file")? else {
@@ -401,6 +568,8 @@ fn choose_settings(config: &mut Config, terminal: &mut Terminal) -> Result<()> {
                 description: config.resources.max_agent_turns.to_string() },
             MenuChoice { command: "Conversation memory length".into(),
                 description: format!("{} messages", config.resources.max_history_messages) },
+            MenuChoice { command: "MCP connections".into(),
+                description: "Connect or remove external development services".into() },
         ];
         let Some(index) = terminal.choose_option("Echo settings", &options)? else { return Ok(()); };
         let mut next = config.clone();
@@ -430,6 +599,7 @@ fn choose_settings(config: &mut Config, terminal: &mut Terminal) -> Result<()> {
                     .context("Number is too large for this computer")?; }
                 else { changed = false; }
             } else { changed = false; },
+            8 => changed = configure_mcp(&mut next, terminal)?,
             _ => unreachable!(),
         }
         if !changed { continue; }
@@ -438,6 +608,71 @@ fn choose_settings(config: &mut Config, terminal: &mut Terminal) -> Result<()> {
         if index == 1 { terminal.set_color(config.terminal.color); }
         terminal.info("Setting saved.");
     }
+}
+
+fn configure_mcp(config: &mut Config, terminal: &mut Terminal) -> Result<bool> {
+    let Some(project) = config.active_project().cloned() else {
+        terminal.info("Connect a project before adding an MCP service.");
+        return Ok(false);
+    };
+    let base: serde_json::Value = serde_json::from_slice(&std::fs::read(&project.host_config)?)?;
+    let servers = base.get("mcp_servers").and_then(serde_json::Value::as_array)
+        .cloned().unwrap_or_default();
+    let mut options = vec![MenuChoice { command:"Connect MCP service".into(),
+        description:"Add an HTTPS MCP endpoint to this project".into() }];
+    for server in &servers {
+        if let Some(id) = server.get("id").and_then(serde_json::Value::as_str) {
+            options.push(MenuChoice { command:format!("Remove {id}"),
+                description:"Disconnect this MCP service".into() });
+        }
+    }
+    let Some(choice) = terminal.choose_option("Project MCP services", &options)? else { return Ok(false); };
+    let (remove, id, new_server) = if choice == 0 {
+        let Some(id) = terminal.prompt_text("Name for this service")? else { return Ok(false); };
+        let id = id.trim().to_owned();
+        if id.is_empty() || id.len() > 64 || !id.bytes().all(|byte|
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')) {
+            bail!("service name must use letters, numbers, hyphens, or underscores");
+        }
+        let Some(url) = terminal.prompt_text("HTTPS MCP endpoint URL")? else { return Ok(false); };
+        if !url.starts_with("https://") || url.contains('@') || url.contains('#') {
+            bail!("MCP service must use an HTTPS URL without embedded credentials");
+        }
+        let bearer_env = terminal.prompt_text("Bearer token environment variable (optional, AMITY_MCP_...)")?
+            .filter(|value| !value.trim().is_empty());
+        if bearer_env.as_deref().is_some_and(|name| !name.starts_with("AMITY_MCP_")
+            || !name.bytes().all(|byte| byte.is_ascii_uppercase()
+                || byte.is_ascii_digit() || byte == b'_')) {
+            bail!("credential name must be an AMITY_MCP_ environment variable");
+        }
+        let server = serde_json::json!({"id":id,"url":url,"bearer_env":bearer_env});
+        (false, id, Some(server))
+    } else {
+        let id = options[choice].command.strip_prefix("Remove ").unwrap_or("").to_owned();
+        (true, id, None)
+    };
+    let project = config.active_project_mut().context("No project is selected")?;
+    let mut bindings = vec![(None, project.host_config.clone())];
+    bindings.extend(project.models.iter().enumerate()
+        .map(|(index, profile)| (Some(index), profile.host_config.clone())));
+    for (index, source) in bindings {
+        let mut binding: serde_json::Value = serde_json::from_slice(&std::fs::read(source)?)?;
+        let fields = binding.as_object_mut().context("Amity connection is not a JSON object")?;
+        let mut current = fields.get("mcp_servers").and_then(serde_json::Value::as_array)
+            .cloned().unwrap_or_default();
+        current.retain(|server| server.get("id").and_then(serde_json::Value::as_str) != Some(&id));
+        if !remove { current.push(new_server.clone().context("new server is missing")?); }
+        fields.insert("mcp_servers".into(), serde_json::Value::Array(current));
+        let label = index.map(|number| project.models[number].name.as_str()).unwrap_or("default");
+        let digest = format!("{:x}", Sha256::digest(
+            format!("{}:mcp:{label}",project.id).as_bytes()));
+        let path = Config::home_dir().join("connections").join(format!("mcp-{digest}.json"));
+        state::write_json_atomic(&path, &binding)?;
+        if let Some(index) = index { project.models[index].host_config = path; }
+        else { project.host_config = path; }
+    }
+    terminal.info(if remove { "MCP service removed." } else { "MCP service saved. Echo will discover its tools when needed." });
+    Ok(true)
 }
 
 fn positive(value: &str) -> Result<u64> {
@@ -497,6 +732,8 @@ echocli \"instruction\"           Ask Echo to work in this project\n\
 echocli resume                  Browse and reopen conversations\n\
 echocli sessions                Browse conversations\n\
 echocli status                  See what Echo is doing\n\
+echocli --json \"instruction\"    Stream machine-readable events\n\
+echocli --attach <file> \"task\"  Include an image or text file\n\
 echocli update [--check]        Install or check for an update\n\
 echocli --version               Show the installed version\n\
 echocli --help                  Show this help\n\nInside Echo:");

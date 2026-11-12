@@ -1,6 +1,6 @@
 [package]
 name = "amity-echo"
-version = "0.1.8"
+version = "0.2.0"
 edition = "2024"
 description = "Amity Echo, the first-party terminal coding agent for Amity"
 
@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0"
+base64 = "0.22"
 crossterm = "0.29"
 ctrlc = "3.4"
 rustyline = "17.0"

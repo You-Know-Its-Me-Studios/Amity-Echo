@@ -1,3 +1,6 @@
 /target/
 /.amity-echo/
 *.tmp-*
+/editor/vscode/node_modules/
+/editor/vscode/*.vsix
+/amity-echo-editor.vsix

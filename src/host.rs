@@ -161,10 +161,38 @@ impl HostClient {
         process.arg(command).arg(&self.config_path).args(args)
             .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
             .env_clear().env("AMITY_HOST_TOKEN", &token);
+        if let Ok(bytes) = fs::read(&self.config_path) {
+            if let Ok(binding) = serde_json::from_slice::<Value>(&bytes) {
+                if let Some(model_args) = binding.get("model_args").and_then(Value::as_array) {
+                    if model_args.first().and_then(Value::as_str) == Some("__model_bridge")
+                        && model_args.get(1).and_then(Value::as_str) == Some("api_chat") {
+                        if let Some(name) = model_args.get(4).and_then(Value::as_str) {
+                            if crate::bridge::validate_key_env(name).is_ok() {
+                                if let Ok(value) = std::env::var(name) { process.env(name, value); }
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // Windows process creation and temporary files can require these
         // operating-system variables. Other inherited credentials are omitted.
-        for name in ["SystemRoot", "WINDIR", "TEMP", "TMP", "PATH"] {
+        for name in ["SystemRoot", "WINDIR", "TEMP", "TMP", "PATH",
+            "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "SSH_AUTH_SOCK"] {
             if let Some(value) = std::env::var_os(name) { process.env(name, value); }
+        }
+        if let Ok(bytes) = fs::read(&self.config_path) {
+            if let Ok(binding) = serde_json::from_slice::<Value>(&bytes) {
+                if let Some(servers) = binding.get("mcp_servers").and_then(Value::as_array) {
+                    for server in servers {
+                        let Some(name) = server.get("bearer_env").and_then(Value::as_str) else { continue; };
+                        if name.starts_with("AMITY_MCP_") && name.bytes().all(|byte|
+                            byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_') {
+                            if let Some(value) = std::env::var_os(name) { process.env(name, value); }
+                        }
+                    }
+                }
+            }
         }
         let mut child = process.spawn().map_err(|error| HostError::Start(format!(
             "Could not start Amity host '{}': {error}", self.executable.display()
@@ -319,8 +347,13 @@ impl HostClient {
     /// Forward one coding-agent action to Amity's governed tool gateway.
     /// Policy denials remain structured host replies for the agent to handle.
     pub fn agent_tool(&self, task_id: Option<&str>, action: Value) -> Result<Value, HostError> {
+        self.agent_tool_cancelable(task_id, action, &AtomicBool::new(false))
+    }
+
+    pub fn agent_tool_cancelable(&self, task_id: Option<&str>, action: Value,
+        cancel: &AtomicBool) -> Result<Value, HostError> {
         let input = json!({"task_id": task_id, "action": action}).to_string();
-        let response = self.call("agent-tool", &[], Some(&input))?;
+        let response = self.call_cancelable("agent-tool", &[], Some(&input), cancel)?;
         if response.records.len() != 1 {
             return Err(HostError::Protocol("Amity agent-tool must return exactly one JSON record".into()));
         }

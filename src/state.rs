@@ -1,4 +1,5 @@
 use crate::config::{Config, invalid};
+use crate::attachments::AttachmentRef;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs::{self, OpenOptions};
@@ -34,6 +35,26 @@ pub struct Session {
     pub pending_instruction: Option<String>,
     #[serde(default)]
     pub agent_task: bool,
+    #[serde(default)]
+    pub usage_input_tokens: u64,
+    #[serde(default)]
+    pub usage_output_tokens: u64,
+    #[serde(default)]
+    pub usage_cost_usd: f64,
+    #[serde(default)]
+    pub context_window: Option<u64>,
+    #[serde(default)]
+    pub last_input_tokens: Option<u64>,
+    #[serde(default)]
+    pub usage_cost_reported: bool,
+    #[serde(default)]
+    pub context_summary: Option<String>,
+    #[serde(default)]
+    pub compacted_messages: usize,
+    #[serde(default)]
+    pub pending_attachments: Vec<AttachmentRef>,
+    #[serde(skip)]
+    pub pending_editor_context: Option<Value>,
 }
 
 impl Session {
@@ -42,6 +63,7 @@ impl Session {
             role,
             content: redact_credentials(content.as_ref()),
             created_at_ms: now_ms(),
+            attachments: Vec::new(),
         });
         self.updated_at_ms = now_ms();
     }
@@ -80,6 +102,8 @@ pub struct Message {
     pub role: MessageRole,
     pub content: String,
     pub created_at_ms: u128,
+    #[serde(default)]
+    pub attachments: Vec<AttachmentRef>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,6 +135,12 @@ impl SessionStore {
             pending_policy_change: None, pending_command: None,
             pending_denial: None,
             pending_instruction: None, agent_task: false,
+            usage_input_tokens: 0, usage_output_tokens: 0,
+            usage_cost_usd: 0.0, context_window: None,
+            last_input_tokens: None, usage_cost_reported: false,
+            context_summary: None, compacted_messages: 0,
+            pending_attachments: Vec::new(),
+            pending_editor_context: None,
         };
         self.save(&session)?;
         Ok(session)
@@ -137,6 +167,11 @@ impl SessionStore {
         for message in &mut safe.messages {
             message.content = redact_credentials(&message.content);
         }
+        if let Some(summary) = &mut safe.context_summary {
+            *summary = redact_credentials(summary);
+        }
+        if let Some(command) = &mut safe.pending_command { redact_value(command); }
+        if let Some(change) = &mut safe.pending_policy_change { *change = redact_credentials(change); }
         write_json_atomic(&self.path_for(&session.id), &safe)
     }
 
@@ -161,6 +196,36 @@ impl SessionStore {
     }
 
     fn path_for(&self, id: &str) -> PathBuf { self.dir.join(format!("{id}.json")) }
+}
+
+fn redact_value(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(text) => *text = redact_credentials(text),
+        serde_json::Value::Array(items) => items.iter_mut().for_each(redact_value),
+        serde_json::Value::Object(fields) => {
+            for (key, value) in fields {
+                if ["password", "secret", "api_key", "access_token", "refresh_token",
+                    "authorization", "private_key"].iter().any(|part| key.to_ascii_lowercase().contains(part)) {
+                    *value = serde_json::Value::String("[redacted credential]".into());
+                } else { redact_value(value); }
+            }
+        }
+        _ => {}
+    }
+}
+
+pub(crate) fn contains_credential(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(fields) => fields.iter().any(|(key, value)| {
+            ["password", "secret", "api_key", "access_token", "refresh_token",
+                "authorization", "private_key"].iter().any(|part| key.to_ascii_lowercase().contains(part))
+                || contains_credential(value)
+        }),
+        serde_json::Value::Array(items) => items.iter().any(contains_credential),
+        serde_json::Value::String(text) => ["sk-", "ghp_", "github_pat_", "glpat-", "xoxb-", "Bearer "]
+            .iter().any(|prefix| text.contains(prefix)),
+        _ => false,
+    }
 }
 
 fn validate_id(id: &str) -> io::Result<()> {

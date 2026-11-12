@@ -33,12 +33,29 @@ jobs:
           if ($env:GITHUB_REF_NAME -ne "v$version") {
             throw "Release tag $env:GITHUB_REF_NAME does not match Cargo version v$version"
           }
+          $editorVersion = (Get-Content editor/vscode/package.json -Raw | ConvertFrom-Json).version
+          if ($editorVersion -ne $version) {
+            throw "VS Code extension version $editorVersion does not match Cargo version $version"
+          }
 
       - name: Build Windows CLI
         shell: pwsh
         run: |
           rustup toolchain install 1.95.0 --profile minimal
           cargo +1.95.0 build --release --locked --target x86_64-pc-windows-msvc
+
+      - name: Set up Node.js for VS Code extension
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Package VS Code extension
+        shell: pwsh
+        run: |
+          Push-Location editor/vscode
+          npm ci --no-audit --no-fund
+          npx @vscode/vsce package --no-dependencies --out ../../amity-echo-editor.vsix
+          Pop-Location
 
       - name: Prepare release assets
         shell: pwsh
@@ -56,4 +73,5 @@ jobs:
           gh release create $env:GITHUB_REF_NAME `
             ./echocli-x86_64-pc-windows-msvc.exe `
             ./echocli-x86_64-pc-windows-msvc.exe.sha256 `
+            ./amity-echo-editor.vsix `
             --verify-tag --latest --title "Amity Echo $env:GITHUB_REF_NAME" --generate-notes

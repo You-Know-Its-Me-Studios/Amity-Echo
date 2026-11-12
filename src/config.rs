@@ -72,7 +72,8 @@ impl ProjectRegistration {
         if let Some(existing) = self.models.iter_mut().find(|model| model.name == name) {
             existing.host_config = host_config;
         } else {
-            self.models.push(ModelProfile { name: name.to_owned(), host_config });
+            self.models.push(ModelProfile { name: name.to_owned(), host_config,
+                supports_images: false });
         }
         Ok(())
     }
@@ -82,6 +83,8 @@ impl ProjectRegistration {
 pub struct ModelProfile {
     pub name: String,
     pub host_config: PathBuf,
+    #[serde(default)]
+    pub supports_images: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

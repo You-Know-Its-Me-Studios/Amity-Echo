@@ -81,6 +81,7 @@ pub struct Terminal {
     color: bool,
     screen: Option<RefCell<Screen>>,
     update_check: Option<Receiver<Result<Option<semver::Version>>>>,
+    plain_stream_chars: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -100,6 +101,8 @@ struct Screen {
     session: String,
     model: String,
     lines: Vec<ScreenLine>,
+    stream_start: Option<usize>,
+    stream_buffer: String,
     input: String,
     cursor: usize,
     scroll: usize,
@@ -132,6 +135,7 @@ impl Terminal {
                 && env::var("TERM").ok().as_deref() != Some("dumb"),
             screen: None,
             update_check: None,
+            plain_stream_chars: 0,
         })
     }
 
@@ -153,7 +157,8 @@ impl Terminal {
         }
         self.screen = Some(RefCell::new(Screen {
             cwd: cwd.to_path_buf(), project: "Local workspace".into(), session: "new".into(),
-            model: "not connected".into(), lines: Vec::new(), input: String::new(),
+            model: "not connected".into(), lines: Vec::new(),
+            stream_start: None, stream_buffer: String::new(), input: String::new(),
             cursor: 0, scroll: 0, status: "Ready".into(), approval: false,
             decision_prompt: None, raw: false,
             history: Vec::new(), history_position: None, saved_draft: String::new(),
@@ -179,6 +184,8 @@ impl Terminal {
             screen.session = session.id.clone();
             screen.model = session.model.as_deref().unwrap_or("default").to_owned();
             screen.lines.clear();
+            screen.stream_start = None;
+            screen.stream_buffer.clear();
             screen.scroll = 0;
             screen.engaged = !session.messages.is_empty();
             screen.input.clear();
@@ -1154,6 +1161,11 @@ impl Terminal {
 
     pub fn assistant(&self, message: &str) {
         if self.screen.is_some() {
+            if let Some(screen) = &self.screen {
+                let mut screen = screen.borrow_mut();
+                if let Some(start) = screen.stream_start.take() { screen.lines.truncate(start); }
+                screen.stream_buffer.clear();
+            }
             self.log("ECHO", Tone::Brand);
             self.log(message, Tone::Assistant);
             self.log("", Tone::Muted);
@@ -1339,6 +1351,67 @@ impl AgentEventSink for Terminal {
     fn emit(&mut self, event: AgentEvent) {
         match event {
             AgentEvent::Assistant { message } => Terminal::assistant(self, &message),
+            AgentEvent::ModelReset => {
+                if let Some(screen) = &self.screen {
+                    let mut screen = screen.borrow_mut();
+                    if let Some(start) = screen.stream_start.take() { screen.lines.truncate(start); }
+                    screen.stream_buffer.clear();
+                    drop(screen);
+                    let _ = self.draw();
+                } else if self.plain_stream_chars > 0 {
+                    eprintln!();
+                    self.plain_stream_chars = 0;
+                }
+            }
+            AgentEvent::ModelDelta { text } => {
+                if let Some(screen) = &self.screen {
+                    let mut screen = screen.borrow_mut();
+                    if screen.stream_start.is_none() { screen.stream_start = Some(screen.lines.len()); }
+                    let start = screen.stream_start.unwrap_or(screen.lines.len());
+                    screen.lines.truncate(start);
+                    screen.stream_buffer.push_str(&text);
+                    if screen.stream_buffer.len() > 32 * 1024 {
+                        screen.stream_buffer = screen.stream_buffer.chars().rev()
+                            .take(32 * 1024).collect::<String>().chars().rev().collect();
+                    }
+                    // Hold the unfinished word until its boundary is known so a
+                    // credential split across model chunks is never printed early.
+                    let visible_end = screen.stream_buffer.rfind(char::is_whitespace)
+                        .map(|index| index + screen.stream_buffer[index..].chars().next()
+                            .map(char::len_utf8).unwrap_or(0)).unwrap_or(0);
+                    let safe = crate::state::redact_credentials(&screen.stream_buffer[..visible_end]);
+                    Self::append_screen_lines(&mut screen, &safe, Tone::Assistant);
+                    screen.status = "Echo is responding".into();
+                    screen.engaged = true;
+                    drop(screen);
+                    let _ = self.draw();
+                } else {
+                    // One-shot output is printed by the completed assistant event.
+                    // A progress mark keeps the shell responsive without exposing
+                    // an incomplete credential token.
+                    let before = self.plain_stream_chars / 80;
+                    self.plain_stream_chars += text.chars().count();
+                    if (before == 0 && self.plain_stream_chars == text.chars().count())
+                        || self.plain_stream_chars / 80 > before {
+                        eprint!("·");
+                        let _ = io::stderr().flush();
+                    }
+                }
+            }
+            AgentEvent::ModelUsage { input_tokens, output_tokens, context_window, cost_usd } => {
+                let mut detail = match (input_tokens, output_tokens) {
+                    (Some(input), Some(output)) => format!("{input} in · {output} out"),
+                    (Some(input), None) => format!("{input} input tokens"),
+                    (None, Some(output)) => format!("{output} output tokens"),
+                    (None, None) => "Model usage".into(),
+                };
+                if let Some(window) = context_window { detail.push_str(&format!(" · {window} context")); }
+                if let Some(cost) = cost_usd { detail.push_str(&format!(" · ${cost:.4}")); }
+                if let Some(screen) = &self.screen {
+                    screen.borrow_mut().status = detail;
+                    let _ = self.draw();
+                }
+            }
             AgentEvent::Info { message } => Terminal::info(self, &message),
             AgentEvent::Warning { message } => Terminal::warning(self, &message),
             AgentEvent::Error { message } => Terminal::error(self, &message),
@@ -1380,6 +1453,67 @@ impl AgentEventSink for Terminal {
 
     fn ask_decision(&mut self, description: &str, choices: &[String]) -> Result<Option<String>> {
         self.ask_policy_decision(description, choices)
+    }
+
+    fn begin_busy(&mut self) -> Result<()> {
+        if let Some(screen) = &self.screen {
+            terminal::enable_raw_mode().context("enabling Echo input during model work")?;
+            screen.borrow_mut().raw = true;
+            self.draw()?;
+        }
+        Ok(())
+    }
+
+    fn poll_busy(&mut self) -> Option<crate::events::BusyInput> {
+        let screen = self.screen.as_ref()?;
+        if !event::poll(Duration::ZERO).ok()? { return None; }
+        match event::read().ok()? {
+            Event::Resize(_, _) => { let _ = self.draw(); None }
+            Event::Key(key) if key.kind != KeyEventKind::Release => {
+                let mut screen = screen.borrow_mut();
+                let result = match key.code {
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        screen.input.clear(); screen.cursor = 0;
+                        Some(crate::events::BusyInput::Cancel)
+                    }
+                    KeyCode::Enter => {
+                        let line = std::mem::take(&mut screen.input);
+                        screen.cursor = 0;
+                        if line.trim() == "/cancel" { Some(crate::events::BusyInput::Cancel) }
+                        else if line.trim().is_empty() { None }
+                        else { Some(crate::events::BusyInput::Message(line)) }
+                    }
+                    KeyCode::Backspace if screen.cursor > 0 => {
+                        let end = byte_index(&screen.input, screen.cursor);
+                        let start = byte_index(&screen.input, screen.cursor - 1);
+                        screen.input.replace_range(start..end, "");
+                        screen.cursor -= 1; None
+                    }
+                    KeyCode::Left => { screen.cursor = screen.cursor.saturating_sub(1); None }
+                    KeyCode::Right => {
+                        screen.cursor = (screen.cursor + 1).min(screen.input.chars().count()); None
+                    }
+                    KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && screen.input.len() < 16 * 1024 => {
+                        let at = byte_index(&screen.input, screen.cursor);
+                        screen.input.insert(at, ch); screen.cursor += 1; None
+                    }
+                    _ => None,
+                };
+                drop(screen);
+                let _ = self.draw();
+                result
+            }
+            _ => None,
+        }
+    }
+
+    fn end_busy(&mut self) -> Result<()> {
+        if let Some(screen) = &self.screen {
+            terminal::disable_raw_mode().context("restoring Echo keyboard mode")?;
+            screen.borrow_mut().raw = false;
+        }
+        Ok(())
     }
 }
 

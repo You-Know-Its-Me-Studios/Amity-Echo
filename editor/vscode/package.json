@@ -1,0 +1,37 @@
+{
+  "name": "amity-echo-editor",
+  "displayName": "Amity Echo",
+  "description": "Send the active file, selection, and diagnostics to Amity Echo.",
+  "version": "0.2.0",
+  "publisher": "you-know-its-me-studios",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/You-Know-Its-Me-Studios/Amity-Echo.git"
+  },
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "main": "./extension.js",
+  "activationEvents": [
+    "onCommand:amityEcho.ask"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "amityEcho.ask",
+        "title": "Amity Echo: Ask About Selection"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "amityEcho.ask",
+          "when": "editorTextFocus"
+        }
+      ]
+    }
+  },
+  "devDependencies": {
+    "@vscode/vsce": "4.1.0"
+  }
+}

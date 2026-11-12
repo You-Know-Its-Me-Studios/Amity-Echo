@@ -8,6 +8,10 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
     Assistant { message: String },
+    ModelDelta { text: String },
+    ModelReset,
+    ModelUsage { input_tokens: Option<u64>, output_tokens: Option<u64>,
+        context_window: Option<u64>, cost_usd: Option<f64> },
     Info { message: String },
     Warning { message: String },
     Error { message: String },
@@ -30,10 +34,15 @@ pub enum AgentEvent {
     Completed { summary: String },
 }
 
+pub enum BusyInput { Cancel, Message(String) }
+
 pub trait AgentEventSink {
     fn emit(&mut self, event: AgentEvent);
     fn ask_approval(&mut self, description: &str) -> Result<bool>;
     fn ask_decision(&mut self, description: &str, choices: &[String]) -> Result<Option<String>>;
+    fn begin_busy(&mut self) -> Result<()> { Ok(()) }
+    fn poll_busy(&mut self) -> Option<BusyInput> { None }
+    fn end_busy(&mut self) -> Result<()> { Ok(()) }
 
     fn request_approval(&mut self, description: &str) -> Result<bool> {
         self.emit(AgentEvent::ApprovalRequested { description: description.into() });
