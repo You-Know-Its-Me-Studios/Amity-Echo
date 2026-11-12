@@ -1,6 +1,7 @@
 mod agent;
 mod attachments;
 mod bridge;
+mod capabilities;
 mod commands;
 mod config;
 mod events;
@@ -207,6 +208,7 @@ fn current_session(config: &Config, store: &SessionStore) -> Result<Session> {
 
 fn interactive(config: &mut Config, store: &SessionStore, terminal: &mut Terminal,
     cancel: &AtomicBool, mut session: Option<Session>) -> Result<()> {
+    let mut steward = StewardMonitor::new(config);
     show_session(terminal, session.as_ref());
     if let Some(current) = session.as_mut() {
         resume_pending(config, store, terminal, cancel, current);
@@ -316,7 +318,8 @@ fn interactive(config: &mut Config, store: &SessionStore, terminal: &mut Termina
                     if let Some(current) = session.as_mut() {
                         if matches!(&current.status, SessionStatus::Running | SessionStatus::WaitingApproval
                             | SessionStatus::AwaitingUserDecision | SessionStatus::Interrupted | SessionStatus::Failed)
-                            && (current.active_task.is_some() || current.pending_policy_change.is_some()) {
+                            && (current.active_task.is_some() || current.pending_policy_change.is_some()
+                                || current.pending_capability.is_some()) {
                             let mut agent = Agent { config, store, session: current, events: terminal,
                                 cancel, interactive: true };
                             agent.cancel_task()
@@ -331,15 +334,51 @@ fn interactive(config: &mut Config, store: &SessionStore, terminal: &mut Termina
                 }
             };
             if let Err(error) = result { terminal.error(&format!("{error:#}")); }
+            if matches!(command.id, Command::Project | Command::Sessions | Command::Settings) {
+                steward.restart(config);
+            }
             continue;
         }
         if let Some(current) = session.as_mut() {
-            let mut agent = Agent { config, store, session: current, events: terminal,
-                cancel, interactive: true };
-            if let Err(error) = agent.instruction(line) { agent.events.error(&format!("{error:#}")); }
+            {
+                let mut agent = Agent { config, store, session: current, events: terminal,
+                    cancel, interactive: true };
+                if let Err(error) = agent.instruction(line) { agent.events.error(&format!("{error:#}")); }
+            }
+            let latest = Config::load().context("reloading Echo capability settings")?;
+            if latest.capabilities != config.capabilities {
+                config.capabilities = latest.capabilities;
+                steward.restart(config);
+            }
         } else {
             terminal.info("Connect a project with /project, then send your request again.");
         }
+    }
+}
+
+struct StewardMonitor {
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl StewardMonitor {
+    fn new(config: &Config) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle = capabilities::persistent::start_steward_monitor(config, Arc::clone(&stop));
+        Self { stop, handle }
+    }
+
+    fn restart(&mut self, config: &Config) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() { let _ = handle.join(); }
+        *self = Self::new(config);
+    }
+}
+
+impl Drop for StewardMonitor {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() { let _ = handle.join(); }
     }
 }
 
@@ -570,6 +609,8 @@ fn choose_settings(config: &mut Config, terminal: &mut Terminal) -> Result<()> {
                 description: format!("{} messages", config.resources.max_history_messages) },
             MenuChoice { command: "MCP connections".into(),
                 description: "Connect or remove external development services".into() },
+            MenuChoice { command: "Capabilities".into(),
+                description: "Choose which engineering features Echo can use".into() },
         ];
         let Some(index) = terminal.choose_option("Echo settings", &options)? else { return Ok(()); };
         let mut next = config.clone();
@@ -600,6 +641,7 @@ fn choose_settings(config: &mut Config, terminal: &mut Terminal) -> Result<()> {
                 else { changed = false; }
             } else { changed = false; },
             8 => changed = configure_mcp(&mut next, terminal)?,
+            9 => changed = configure_capabilities(&mut next, terminal)?,
             _ => unreachable!(),
         }
         if !changed { continue; }
@@ -608,6 +650,130 @@ fn choose_settings(config: &mut Config, terminal: &mut Terminal) -> Result<()> {
         if index == 1 { terminal.set_color(config.terminal.color); }
         terminal.info("Setting saved.");
     }
+}
+
+fn configure_capabilities(config: &mut Config, terminal: &mut Terminal) -> Result<bool> {
+    let project = config.active_project().cloned();
+    let descriptors = capabilities::descriptors(config, project.as_ref(), None);
+    let profile = config.capabilities.get("budget_profile").and_then(serde_json::Value::as_str)
+        .unwrap_or("balanced");
+    let retention = project.as_ref().is_some_and(|project| {
+        let setting = config.capabilities.get("projects")
+            .and_then(|projects| projects.get(&project.id))
+            .and_then(|settings| settings.pointer("/overrides/experience_loop"));
+        let enabled = setting.and_then(|setting| setting.get("enabled"))
+            .and_then(serde_json::Value::as_bool).unwrap_or(false);
+        let retained = setting.and_then(|setting| setting.get("retain"))
+            .and_then(serde_json::Value::as_bool)
+            .or_else(|| config.capabilities.pointer("/privacy/experience_retention")
+                .and_then(serde_json::Value::as_bool)).unwrap_or(false);
+        enabled && retained
+    });
+    let mut options = vec![
+        MenuChoice { command: "Resource use".into(),
+            description: format!("{} · limits model work and parallel workers", profile.replace('_', " ")) },
+        MenuChoice { command: "Keep experience lessons".into(),
+            description: if project.is_none() { "Connect a project first" }
+                else if retention { "On for this project · local to this computer" }
+                else { "Off for this project" }.into() },
+    ];
+    for descriptor in &descriptors {
+        let auto_monitor = project.as_ref().and_then(|project| config.capabilities
+            .get("projects").and_then(|value| value.get(&project.id)))
+            .and_then(|value| value.pointer("/overrides/project_steward/auto_monitor"))
+            .and_then(serde_json::Value::as_bool).unwrap_or(false);
+        let status = if descriptor.id == "project_steward" && auto_monitor {
+            "Scheduled while Echo is open".to_owned()
+        } else if descriptor.activation_mode == "always" { "Always on".to_owned() }
+            else if descriptor.availability.enabled {
+                if descriptor.availability.activation == "manual" { "On request".into() }
+                else { "Automatic when useful".into() }
+            } else { "Off".into() };
+        options.push(MenuChoice { command: descriptor.name.into(),
+            description: format!("{status} · {}", descriptor.purpose) });
+    }
+    let Some(choice) = terminal.choose_option("Echo capabilities", &options)? else { return Ok(false); };
+    if choice == 0 {
+        let choices = [
+            MenuChoice { command: "Low cost".into(), description: "Short investigations and one worker".into() },
+            MenuChoice { command: "Balanced".into(), description: "Reasonable limits for normal development".into() },
+            MenuChoice { command: "Extensive".into(), description: "Larger bounded investigations".into() },
+        ];
+        let Some(index) = terminal.choose_option("Resource use", &choices)? else { return Ok(false); };
+        config.capabilities["budget_profile"] = serde_json::json!(match index {
+            0 => "low_cost", 1 => "balanced", _ => "extensive",
+        });
+        return Ok(true);
+    }
+    if choice == 1 {
+        let Some(project) = &project else {
+            terminal.info("Connect a project with /project before changing experience retention.");
+            return Ok(false);
+        };
+        let setting = &mut config.capabilities["projects"][project.id.as_str()]
+            ["overrides"]["experience_loop"];
+        setting["enabled"] = serde_json::json!(!retention);
+        setting["retain"] = serde_json::json!(!retention);
+        setting["activation"] = serde_json::json!(if retention { "off" } else { "manual" });
+        return Ok(true);
+    }
+    let descriptor = &descriptors[choice - 2];
+    if descriptor.activation_mode == "always" {
+        terminal.info(&format!("{}: {}", descriptor.name, descriptor.purpose));
+        terminal.info(&descriptor.availability.reason);
+        return Ok(false);
+    }
+    let choices = if descriptor.id == "project_steward" {
+        vec![
+            MenuChoice { command: "Available on request".into(),
+                description: "Inspect project health only when you ask".into() },
+            MenuChoice { command: "Monitor while Echo is open".into(),
+                description: "Run read-only checks on a schedule while this terminal is open".into() },
+            MenuChoice { command: "Off".into(), description: "Do not monitor this project".into() },
+        ]
+    } else if descriptor.activation_mode == "conditional" {
+        vec![
+            MenuChoice { command: "Automatic when useful".into(),
+                description: "Echo may use this for relevant work within your resource limits".into() },
+            MenuChoice { command: "Only when I ask".into(),
+                description: "Available for explicit requests".into() },
+            MenuChoice { command: "Off".into(), description: "Do not activate".into() },
+        ]
+    } else {
+        vec![
+            MenuChoice { command: "Enable on request".into(),
+                description: "Keep this feature available when you explicitly use it".into() },
+            MenuChoice { command: "Off".into(), description: "Do not activate".into() },
+        ]
+    };
+    let Some(index) = terminal.choose_option(descriptor.name, &choices)? else { return Ok(false); };
+    let (enabled, activation) = if descriptor.id == "project_steward" {
+        match index { 0 | 1 => (true, "manual"), _ => (false, "off") }
+    } else if descriptor.activation_mode == "conditional" {
+        match index { 0 => (true, "automatic"), 1 => (true, "manual"), _ => (false, "off") }
+    } else if index == 0 { (true, "manual") } else { (false, "off") };
+    let scope = if let Some(project) = &project {
+        &mut config.capabilities["projects"][project.id.as_str()]["overrides"][descriptor.id]
+    } else { &mut config.capabilities["overrides"][descriptor.id] };
+    scope["enabled"] = serde_json::json!(enabled);
+    scope["activation"] = serde_json::json!(activation);
+    if descriptor.id == "experience_loop" {
+        scope["retain"] = serde_json::json!(enabled);
+    }
+    if descriptor.id == "project_steward" {
+        scope["auto_monitor"] = serde_json::json!(index == 1);
+        if index == 1 {
+            let interval = terminal.prompt_text("Check every how many minutes? (minimum 5)")?;
+            if let Some(interval) = interval {
+                let minutes = positive(&interval)?;
+                if !(5..=43_200).contains(&minutes) {
+                    bail!("Choose between 5 and 43,200 minutes.");
+                }
+                scope["interval_seconds"] = serde_json::json!(minutes * 60);
+            } else { return Ok(false); }
+        }
+    }
+    Ok(true)
 }
 
 fn configure_mcp(config: &mut Config, terminal: &mut Terminal) -> Result<bool> {

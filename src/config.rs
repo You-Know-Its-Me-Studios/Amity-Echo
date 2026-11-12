@@ -13,6 +13,8 @@ pub struct Config {
     pub terminal: TerminalSettings,
     pub execution: ExecutionSettings,
     pub resources: ResourceSettings,
+    #[serde(default)]
+    pub capabilities: serde_json::Value,
 }
 
 impl Default for Config {
@@ -26,6 +28,7 @@ impl Default for Config {
             terminal: TerminalSettings::default(),
             execution: ExecutionSettings::default(),
             resources: ResourceSettings::default(),
+            capabilities: serde_json::json!({}),
         }
     }
 }

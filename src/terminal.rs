@@ -1444,6 +1444,15 @@ impl AgentEventSink for Terminal {
                 Terminal::info(self, &format!("Task {task_id} · {state}"));
             }
             AgentEvent::Completed { summary } => Terminal::info(self, &summary),
+            AgentEvent::Capability { id, action, status, message } => {
+                if matches!(id.as_str(), "engineering_memory" | "experience_loop")
+                    && action == "observe" { return; }
+                if matches!(status.as_str(), "unavailable" | "failed" | "awaiting_user_decision") {
+                    Terminal::warning(self, &message);
+                } else if !message.is_empty() {
+                    Terminal::info(self, &message);
+                }
+            }
         }
     }
 

@@ -30,6 +30,8 @@ pub struct Session {
     #[serde(default)]
     pub pending_command: Option<Value>,
     #[serde(default)]
+    pub pending_capability: Option<Value>,
+    #[serde(default)]
     pub pending_denial: Option<String>,
     #[serde(default)]
     pub pending_instruction: Option<String>,
@@ -55,6 +57,8 @@ pub struct Session {
     pub pending_attachments: Vec<AttachmentRef>,
     #[serde(skip)]
     pub pending_editor_context: Option<Value>,
+    #[serde(default)]
+    pub capability_state: Value,
 }
 
 impl Session {
@@ -132,7 +136,7 @@ impl SessionStore {
             created_at_ms: now, updated_at_ms: now,
             status: SessionStatus::Idle, messages: Vec::new(), task_ids: Vec::new(),
             active_task: None, active_step: None, pending_approval: None,
-            pending_policy_change: None, pending_command: None,
+            pending_policy_change: None, pending_command: None, pending_capability: None,
             pending_denial: None,
             pending_instruction: None, agent_task: false,
             usage_input_tokens: 0, usage_output_tokens: 0,
@@ -141,6 +145,7 @@ impl SessionStore {
             context_summary: None, compacted_messages: 0,
             pending_attachments: Vec::new(),
             pending_editor_context: None,
+            capability_state: serde_json::json!({}),
         };
         self.save(&session)?;
         Ok(session)
@@ -171,6 +176,8 @@ impl SessionStore {
             *summary = redact_credentials(summary);
         }
         if let Some(command) = &mut safe.pending_command { redact_value(command); }
+        if let Some(request) = &mut safe.pending_capability { redact_value(request); }
+        redact_value(&mut safe.capability_state);
         if let Some(change) = &mut safe.pending_policy_change { *change = redact_credentials(change); }
         write_json_atomic(&self.path_for(&session.id), &safe)
     }

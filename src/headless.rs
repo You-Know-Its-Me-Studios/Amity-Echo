@@ -76,6 +76,7 @@ fn redact_event(event: &mut AgentEvent) {
         AgentEvent::PolicyDecision { reason, .. } => *reason = redact_credentials(reason),
         AgentEvent::ApprovalRequested { description } => *description = redact_credentials(description),
         AgentEvent::Completed { summary } => *summary = redact_credentials(summary),
+        AgentEvent::Capability { message, .. } => *message = redact_credentials(message),
         _ => {}
     }
 }

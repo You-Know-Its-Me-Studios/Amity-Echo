@@ -32,6 +32,7 @@ pub enum AgentEvent {
     ApprovalRequested { description: String },
     TaskState { task_id: String, state: String },
     Completed { summary: String },
+    Capability { id: String, action: String, status: String, message: String },
 }
 
 pub enum BusyInput { Cancel, Message(String) }
