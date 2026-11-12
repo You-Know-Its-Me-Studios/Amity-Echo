@@ -405,6 +405,94 @@ impl Terminal {
         result
     }
 
+    /// Show the public command reference without changing the active conversation.
+    pub fn show_help(&mut self, commands: &[crate::commands::CommandSpec]) -> Result<()> {
+        if self.screen.is_none() {
+            let width = terminal::size().ok().map(|(width, _)| usize::from(width))
+                .filter(|width| *width > 0).unwrap_or(80);
+            println!("{}", self.paint("ECHO HELP", "1;36"));
+            println!("{}", "─".repeat(width.saturating_sub(4).min(52).max(1)));
+            if width < 19 {
+                println!("Enlarge the terminal to read help.");
+                return Ok(());
+            }
+            for (line, _) in format_help_lines(commands, width) {
+                println!("{line}");
+            }
+            return Ok(());
+        }
+        terminal::enable_raw_mode().context("enabling Echo help input")?;
+        self.screen.as_ref().expect("screen is present").borrow_mut().raw = true;
+        let result = self.help_screen_loop(commands);
+        let disable = terminal::disable_raw_mode().context("restoring normal terminal input");
+        if disable.is_ok() {
+            self.screen.as_ref().expect("screen is present").borrow_mut().raw = false;
+        }
+        let redraw = self.draw();
+        disable?;
+        redraw?;
+        result
+    }
+
+    fn help_screen_loop(&self, commands: &[crate::commands::CommandSpec]) -> Result<()> {
+        let mut scroll = 0usize;
+        loop {
+            let (max_scroll, page_rows) = self.draw_help_screen(commands, scroll)?;
+            scroll = scroll.min(max_scroll);
+            match event::read().context("reading Echo help input")? {
+                Event::Resize(_, _) => {}
+                Event::Key(key) if key.kind != KeyEventKind::Release => match key.code {
+                    KeyCode::Esc => return Ok(()),
+                    KeyCode::Char('c' | 'd') if key.modifiers.contains(KeyModifiers::CONTROL) => return Ok(()),
+                    KeyCode::Up => scroll = scroll.saturating_sub(1),
+                    KeyCode::Down => scroll = (scroll + 1).min(max_scroll),
+                    KeyCode::PageUp => scroll = scroll.saturating_sub(page_rows),
+                    KeyCode::PageDown => scroll = scroll.saturating_add(page_rows).min(max_scroll),
+                    KeyCode::Home => scroll = 0,
+                    KeyCode::End => scroll = max_scroll,
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+    }
+
+    fn draw_help_screen(&self, commands: &[crate::commands::CommandSpec],
+        scroll: usize) -> Result<(usize, usize)> {
+        let (width, height) = terminal::size().context("reading terminal size")?;
+        let width = usize::from(width);
+        let height = usize::from(height);
+        if width == 0 || height == 0 { return Ok((0, 1)); }
+        let mut out = io::stdout();
+        queue!(out, Hide, MoveTo(0, 0), Clear(ClearType::All))?;
+        if width < 19 || height < 8 {
+            self.at(&mut out, 0, 0, width, " ECHO HELP", Tone::Brand)?;
+            if height > 1 {
+                self.at(&mut out, 0, 1, width, " Enlarge the terminal to read help.", Tone::Warning)?;
+            }
+            out.flush()?;
+            return Ok((0, 1));
+        }
+        self.at(&mut out, 2, 0, width.saturating_sub(4), "ECHO HELP", Tone::Brand)?;
+        self.at(&mut out, 2, 1, width.saturating_sub(4),
+            &"─".repeat(width.saturating_sub(4).min(52)), Tone::Muted)?;
+        let lines = format_help_lines(commands, width);
+        let page_rows = height.saturating_sub(5);
+        let max_scroll = lines.len().saturating_sub(page_rows);
+        let start = scroll.min(max_scroll);
+        for (offset, (line, tone)) in lines.iter().skip(start).take(page_rows).enumerate() {
+            self.at(&mut out, 2, (3 + offset) as u16, width.saturating_sub(4), line, *tone)?;
+        }
+        self.at(&mut out, 0, (height - 2) as u16, width.saturating_sub(1),
+            &"─".repeat(width.saturating_sub(1)), Tone::Muted)?;
+        let position = if max_scroll == 0 { "All commands".to_owned() }
+            else { format!("Line {} of {}", start + 1, lines.len()) };
+        self.at(&mut out, 2, (height - 1) as u16, width.saturating_sub(4),
+            &format!("{position} · ↑↓ scroll · PgUp/PgDn page · Esc back"), Tone::Muted)?;
+        out.flush().context("drawing Echo help")?;
+        Ok((max_scroll, page_rows))
+    }
+
     fn session_picker_loop(&self, entries: &[SessionPickerEntry]) -> Result<Option<String>> {
         let mut query = String::new();
         let mut cwd_only = true;
@@ -1366,6 +1454,67 @@ fn relative_age(elapsed_ms: u128) -> String {
     else if minutes < 1_440 { format!("{}h ago", minutes / 60) }
     else if minutes < 525_600 { format!("{}d ago", minutes / 1_440) }
     else { format!("{}y ago", minutes / 525_600) }
+}
+
+fn format_help_lines(commands: &[crate::commands::CommandSpec], terminal_width: usize)
+    -> Vec<(String, Tone)> {
+    let width = terminal_width.saturating_sub(4).max(1);
+    let label_width = commands.iter().map(|command| command.name.chars().count())
+        .max().unwrap_or(0) + 2;
+    let wide = width >= label_width + 20;
+    let indent = if wide { label_width } else if width >= label_width {
+        2.min(width.saturating_sub(1))
+    } else { 0 };
+    let description_width = width.saturating_sub(indent).max(1);
+    let padding = " ".repeat(indent);
+    let mut lines = Vec::new();
+    for command in commands {
+        let description = wrap_help_words(command.description, description_width);
+        if wide {
+            lines.push((format!("{:<label_width$}{}", command.name, description[0]), Tone::Assistant));
+            for part in description.iter().skip(1) {
+                lines.push((format!("{padding}{part}"), Tone::Assistant));
+            }
+        } else {
+            lines.push((command.name.to_owned(), Tone::Brand));
+            for part in description {
+                lines.push((format!("{padding}{part}"), Tone::Assistant));
+            }
+        }
+        for part in wrap_help_words(&format!("Usage: {}", command.name), description_width) {
+            lines.push((format!("{padding}{part}"), Tone::Muted));
+        }
+        lines.push((String::new(), Tone::Muted));
+    }
+    lines
+}
+
+fn wrap_help_words(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        let mut remainder = word;
+        while remainder.chars().count() > width {
+            if !line.is_empty() { lines.push(std::mem::take(&mut line)); }
+            let split = byte_index(remainder, width);
+            lines.push(remainder[..split].to_owned());
+            remainder = &remainder[split..];
+        }
+        if remainder.is_empty() { continue; }
+        if line.is_empty() {
+            line.push_str(remainder);
+        } else if line.chars().count() + 1 + remainder.chars().count() <= width {
+            line.push(' ');
+            line.push_str(remainder);
+        } else {
+            lines.push(std::mem::take(&mut line));
+            line.push_str(remainder);
+        }
+    }
+    if !line.is_empty() { lines.push(line); }
+    if lines.is_empty() { lines.push(String::new()); }
+    lines
 }
 
 fn wrap(text: &str, width: usize) -> Vec<String> {

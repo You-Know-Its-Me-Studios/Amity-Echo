@@ -21,16 +21,16 @@ pub struct CommandSpec {
 }
 
 pub const COMMANDS: &[CommandSpec] = &[
-    CommandSpec { name: "/help", description: "Show commands and what they do", id: Command::Help },
-    CommandSpec { name: "/model", description: "Choose the AI model for this conversation", id: Command::Model },
-    CommandSpec { name: "/project", description: "Switch or connect a project", id: Command::Project },
-    CommandSpec { name: "/sessions", description: "Browse and reopen conversations", id: Command::Sessions },
-    CommandSpec { name: "/new-session", description: "Start a new conversation", id: Command::NewSession },
-    CommandSpec { name: "/status", description: "See what Echo is doing", id: Command::Status },
-    CommandSpec { name: "/settings", description: "View or change Echo settings", id: Command::Settings },
-    CommandSpec { name: "/review-changes", description: "Review a proposed change", id: Command::ReviewChanges },
-    CommandSpec { name: "/cancel", description: "Cancel the current operation", id: Command::Cancel },
-    CommandSpec { name: "/exit", description: "Close Echo", id: Command::Exit },
+    CommandSpec { name: "/help", description: "Show available commands and how to use them.", id: Command::Help },
+    CommandSpec { name: "/model", description: "Choose which AI model Echo uses.", id: Command::Model },
+    CommandSpec { name: "/project", description: "Select or connect a project.", id: Command::Project },
+    CommandSpec { name: "/sessions", description: "Browse and reopen previous conversations.", id: Command::Sessions },
+    CommandSpec { name: "/new-session", description: "Start a new conversation in this project.", id: Command::NewSession },
+    CommandSpec { name: "/status", description: "See what Echo is currently doing.", id: Command::Status },
+    CommandSpec { name: "/settings", description: "View or change Echo's settings.", id: Command::Settings },
+    CommandSpec { name: "/review-changes", description: "Review a proposed change and decide whether to apply it.", id: Command::ReviewChanges },
+    CommandSpec { name: "/cancel", description: "Cancel the current operation.", id: Command::Cancel },
+    CommandSpec { name: "/exit", description: "Close Echo and return to the terminal.", id: Command::Exit },
 ];
 
 pub fn find(name: &str) -> Option<&'static CommandSpec> {

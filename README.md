@@ -29,16 +29,16 @@ Inside Echo, type `/` to open the command menu. The menu filters as you type and
 
 | Command | What it does |
 | --- | --- |
-| `/help` | Show commands and their descriptions. |
-| `/model` | Choose a configured AI model. |
-| `/project` | Choose or connect an Amity project. |
-| `/sessions` | Search and reopen conversations. |
-| `/new-session` | Start a new conversation in the current project. |
-| `/status` | See what Echo is doing now. |
-| `/settings` | View and change Echo settings. |
-| `/review-changes` | Review proposed code changes and available decisions. |
+| `/help` | Show available commands and how to use them. |
+| `/model` | Choose which AI model Echo uses. |
+| `/project` | Select or connect a project. |
+| `/sessions` | Browse and reopen previous conversations. |
+| `/new-session` | Start a new conversation in this project. |
+| `/status` | See what Echo is currently doing. |
+| `/settings` | View or change Echo's settings. |
+| `/review-changes` | Review a proposed change and decide whether to apply it. |
 | `/cancel` | Cancel the current operation. |
-| `/exit` | Close Echo and return to the shell. |
+| `/exit` | Close Echo and return to the terminal. |
 
 Echo presents approvals and policy decisions when they are needed. You can describe coding work in ordinary language; Echo coordinates the agent and Amity workflow. If a project, model, or permission is missing, Echo explains the next step. Press Ctrl+C at the idle composer to return to the shell. During active work, Ctrl+C cancels the current operation.
 

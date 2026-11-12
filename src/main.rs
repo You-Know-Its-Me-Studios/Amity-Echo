@@ -157,7 +157,7 @@ fn interactive(config: &mut Config, store: &SessionStore, terminal: &mut Termina
                 continue;
             };
             let result = match command.id {
-                Command::Help => { print_interactive_help(terminal); Ok(()) }
+                Command::Help => terminal.show_help(COMMANDS),
                 Command::Exit => return Ok(()),
                 Command::Project => {
                     (|| -> Result<()> {
@@ -505,8 +505,3 @@ echocli --help                  Show this help\n\nInside Echo:");
     }
 }
 
-fn print_interactive_help(terminal: &Terminal) {
-    for command in COMMANDS {
-        terminal.info(&format!("{:<18} {}", command.name, command.description));
-    }
-}
