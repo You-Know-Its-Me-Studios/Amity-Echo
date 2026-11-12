@@ -395,7 +395,7 @@ impl Terminal {
         if cancelled {anyhow::bail!("Cadenza connection cancelled; settings unchanged");} result
     }
 
-    pub fn choose_model(&mut self,models:&[crate::cadenza::ModelSelection],initial:usize,current:Option<&str>)->Result<Option<usize>> {
+    pub fn choose_model(&mut self,models:&[crate::inference::ModelSelection],initial:usize,current:Option<&str>)->Result<Option<usize>> {
         if self.screen.is_none(){anyhow::bail!("Open Echo's interactive terminal to choose a Cadenza model");}
         if models.is_empty(){return Ok(None);}
         terminal::enable_raw_mode()?;
@@ -423,7 +423,7 @@ impl Terminal {
         if restore.is_ok(){self.screen.as_ref().unwrap().borrow_mut().raw=false;}
         restore?; self.draw()?;result
     }
-    fn draw_model_picker(&self,models:&[crate::cadenza::ModelSelection],selected:usize,current:Option<&str>,scroll:usize)->Result<()> {
+    fn draw_model_picker(&self,models:&[crate::inference::ModelSelection],selected:usize,current:Option<&str>,scroll:usize)->Result<()> {
         let (width,height)=terminal::size()?;let w=usize::from(width);let h=usize::from(height);let mut out=io::stdout();
         queue!(out,MoveTo(0,0),Clear(ClearType::All))?;
         self.at(&mut out,0,0,w," AMITY ECHO / Cadenza models",Tone::Brand)?;

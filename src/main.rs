@@ -2,6 +2,7 @@ mod agent;
 mod attachments;
 mod cadenza;
 mod credentials;
+mod development;
 mod capabilities;
 mod commands;
 mod config;
@@ -9,6 +10,7 @@ mod events;
 mod headless;
 mod ide;
 mod host;
+mod inference;
 mod model;
 mod skills;
 mod state;
@@ -209,7 +211,7 @@ fn interactive(config: &mut Config, store: &SessionStore, terminal: &mut Termina
     show_session(config, terminal, session.as_ref());
     let settings=config.cadenza.clone();let selected=session.as_ref().and_then(|s|s.cadenza_model.clone()).or(config.cadenza.default_model.clone());
     match terminal.wait_for_work(move || {
-        let mut client=cadenza::Client::connect(&settings)?;
+        let mut client=inference::Connection::connect(&settings)?;
         let models=client.discover()?;client.health()?;
         if let Some(selected)=selected {let current=models.iter().find(|m|m.root==selected.root && m.identity==selected.identity && m.ready()).context("Selected Cadenza model is unavailable; open /model")?;Ok(format!("Cadenza ready · {}",current.label()))}
         else {Ok(format!("Cadenza connected · {} available model(s). Open /model to choose the global default.",models.len()))}
@@ -495,10 +497,10 @@ fn select_session_project(config: &mut Config, session: &Session) -> Result<()> 
 
 fn choose_model(config: &mut Config, store: &SessionStore, terminal: &mut Terminal,
     session: &mut Session) -> Result<()> {
-    terminal.info("Connecting to Cadenza and discovering models…");
+    terminal.info("Discovering available models…");
     let settings=config.cadenza.clone();
     let models=terminal.wait_for_work(move || {
-        let mut client=cadenza::Client::connect(&settings)?;
+        let mut client=inference::Connection::connect(&settings)?;
         let models=client.discover()?; client.health()?; Ok(models)
     })?;
     if models.is_empty() { bail!("Cadenza returned no models; the existing selection was preserved"); }
@@ -509,7 +511,7 @@ fn choose_model(config: &mut Config, store: &SessionStore, terminal: &mut Termin
     if !candidate.ready() {bail!("This Cadenza model is not ready. The existing selection was preserved");}
     let settings=config.cadenza.clone();let requested=candidate.clone();
     let candidate=terminal.wait_for_work(move || {
-        let mut client=cadenza::Client::connect(&settings)?;
+        let mut client=inference::Connection::connect(&settings)?;
         client.validate_selection(&requested)
     })?;
     let mut next=config.clone(); next.cadenza.default_model=Some(candidate.clone());
@@ -524,24 +526,31 @@ fn choose_model(config: &mut Config, store: &SessionStore, terminal: &mut Termin
 }
 
 fn configure_cadenza(config:&mut Config,terminal:&mut Terminal)->Result<bool> {
-    let options=[MenuChoice {command:"Endpoint".into(),description:config.cadenza.endpoint.clone()},
-        MenuChoice {command:"Credential reference".into(),description:config.cadenza.credential_ref.clone()},
-        MenuChoice {command:"Store credential in Windows Credential Manager".into(),description:"Import from an environment variable; the value is never shown or saved in JSON".into()},
-        MenuChoice {command:"Maximum generated tokens".into(),description:config.cadenza.max_tokens.to_string()}];
-    let Some(choice)=terminal.choose_option("Cadenza connection",&options)? else{return Ok(false);};
+    let options=[
+        MenuChoice {command:"Development service executable".into(),description:config.cadenza.development_executable.as_ref().map(|p|p.display().to_string()).unwrap_or_else(||"Not configured".into())},
+        MenuChoice {command:"Development service configuration".into(),description:config.cadenza.development_config.as_ref().map(|p|p.display().to_string()).unwrap_or_else(||"Not configured".into())},
+        MenuChoice {command:"Development endpoint".into(),description:config.cadenza.endpoint.clone()},
+        MenuChoice {command:"Maximum generated tokens".into(),description:config.cadenza.max_tokens.to_string()},
+    ];
+    let Some(choice)=terminal.choose_option("Local development inference",&options)? else{return Ok(false);};
     match choice {
-        0=>if let Some(value)=terminal.prompt_text("Cadenza endpoint (ws://loopback/cadenza or wss://host/cadenza)")?{config.cadenza.endpoint=value.trim().to_owned();crate::cadenza::endpoint(&config.cadenza)?;}else{return Ok(false);},
-        1=>if let Some(value)=terminal.prompt_text("Credential reference (env:CADENZA_API_TOKEN or windows:Amity/Echo/Cadenza/default)")?{
-            let value=value.trim();if let Some(name)=value.strip_prefix("env:"){credentials::validate_env(name)?;}else if !value.starts_with("windows:Amity/Echo/Cadenza/"){bail!("Use env: or an Echo Cadenza Windows credential reference");}
-            config.cadenza.credential_ref=value.to_owned();
+        0|1=>{
+            let label=if choice==0{"Path to the Cadenza executable"}else{"Path to the Cadenza development JSON configuration"};
+            let Some(value)=terminal.prompt_text(label)? else{return Ok(false);};
+            let value=value.trim().trim_matches('"');
+            if value.is_empty(){return Ok(false);}
+            let path=PathBuf::from(value).canonicalize().with_context(||format!("File is unavailable: {value}"))?;
+            if !path.is_file(){bail!("Choose an existing file");}
+            if choice==0{config.cadenza.development_executable=Some(path);}else{config.cadenza.development_config=Some(path);}
+        },
+        2=>if let Some(value)=terminal.prompt_text("Loopback development endpoint (ws://127.0.0.1:7941/cadenza)")?{
+            config.cadenza.endpoint=value.trim().to_owned();inference::validate_endpoint(&config.cadenza)?;
         }else{return Ok(false);},
-        2=>{let Some(name)=terminal.prompt_text("Environment variable containing the credential (Enter for CADENZA_API_TOKEN)")? else{return Ok(false);};
-            credentials::store_environment(if name.trim().is_empty(){"CADENZA_API_TOKEN"}else{name.trim()},"Amity/Echo/Cadenza/default")?;
-            config.cadenza.credential_ref="windows:Amity/Echo/Cadenza/default".into();terminal.info("Credential saved in Windows Credential Manager.");},
         3=>if let Some(value)=terminal.prompt_text("Maximum generated tokens (1..256; prompt plus output must fit the selected model)")?{
             let count=value.trim().parse::<u16>().context("Enter an integer from 1 to 256")?;if !(1..=256).contains(&count){bail!("Enter an integer from 1 to 256");}config.cadenza.max_tokens=count;
         }else{return Ok(false);},_=>unreachable!(),
-    }Ok(true)
+    }
+    Ok(true)
 }
 
 fn choose_settings(config: &mut Config, terminal: &mut Terminal) -> Result<()> {
@@ -567,7 +576,7 @@ fn choose_settings(config: &mut Config, terminal: &mut Terminal) -> Result<()> {
                 description: "Connect or remove external development services".into() },
             MenuChoice { command: "Capabilities".into(),
                 description: "Choose which engineering features Echo can use".into() },
-            MenuChoice {command:"Cadenza connection".into(),description:config.cadenza.endpoint.clone()},
+            MenuChoice {command:"Local development inference".into(),description:"Choose a Cadenza installation; Echo handles its credential".into()},
         ];
         let Some(index) = terminal.choose_option("Echo settings", &options)? else { return Ok(()); };
         let mut next = config.clone();

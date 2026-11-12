@@ -1,6 +1,6 @@
 //! Echo context and turn validation over the native Cadenza client.
 use crate::{
-    cadenza::{Client, ModelSelection},
+    inference::{Connection, ModelSelection},
     config::{CadenzaSettings, Config},
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -94,8 +94,8 @@ impl ChatModel {
         let settings = self.settings.clone();
         let selected = self.selected.clone();
         thread::scope(|scope| -> Result<ModelTurn> {
-            let worker = scope.spawn(|| -> Result<(crate::cadenza::Completion, ModelSelection)> {
-                let mut client = Client::connect(&settings)?;
+            let worker = scope.spawn(|| -> Result<(crate::inference::Completion, ModelSelection)> {
+                let mut client = Connection::connect(&settings)?;
                 let current = client.validate_selection(&selected)?;
                 let completion =
                     client.generate(&current, &prompt, settings.max_tokens, cancel, |event| {
@@ -229,7 +229,7 @@ pub fn host_turn(args: &[String]) -> Result<()> {
         "Invalid Cadenza task model root"
     );
     let config = Config::load()?;
-    let mut client = Client::connect(&config.cadenza)?;
+    let mut client = Connection::connect(&config.cadenza)?;
     let selected = client
         .discover()?
         .into_iter()

@@ -63,14 +63,18 @@ impl ProjectRegistration {
 pub struct CadenzaSettings {
     pub endpoint: String,
     pub credential_ref: String,
-    pub default_model: Option<crate::cadenza::ModelSelection>,
+    pub default_model: Option<crate::inference::ModelSelection>,
+    /// Optional local development installation. Customer releases do not bundle Cadenza.
+    pub development_executable: Option<PathBuf>,
+    pub development_config: Option<PathBuf>,
     pub connect_timeout_seconds: u64,
     pub request_timeout_seconds: u64,
     pub max_tokens: u16,
 }
 impl Default for CadenzaSettings {
     fn default() -> Self {
-        Self {endpoint:"ws://127.0.0.1:7941/cadenza".into(),credential_ref:"env:CADENZA_API_TOKEN".into(),default_model:None,
+        Self {endpoint:"ws://127.0.0.1:7941/cadenza".into(),credential_ref:"windows:Amity/Echo/Cadenza/development".into(),default_model:None,
+            development_executable:None,development_config:None,
             connect_timeout_seconds:5,request_timeout_seconds:120,max_tokens:32}
     }
 }
@@ -153,7 +157,12 @@ impl Config {
                         if let Some(host)=host {project["host_config"]=host;}
                     }
                 }
-                let config:Self=serde_json::from_value(value).map_err(|e|invalid(format!("{}: {e}",path.display())))?;
+                let mut config:Self=serde_json::from_value(value).map_err(|e|invalid(format!("{}: {e}",path.display())))?;
+                // The old default was an internal service environment variable. Existing
+                // users retain explicit custom references, but the default now uses the vault.
+                if config.cadenza.credential_ref == "env:CADENZA_API_TOKEN" {
+                    config.cadenza.credential_ref = "windows:Amity/Echo/Cadenza/development".into();
+                }
                 if legacy {
                     let backup=Self::home_dir().join("config.pre-cadenza.json");
                     match fs::OpenOptions::new().write(true).create_new(true).open(backup) {

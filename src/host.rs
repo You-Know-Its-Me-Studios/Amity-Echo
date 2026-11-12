@@ -65,7 +65,7 @@ pub struct HostClient {
     token_file: Option<PathBuf>,
     timeout: Duration,
     max_output_bytes: usize,
-    native_model: Option<crate::cadenza::ModelSelection>,
+    native_model: Option<crate::inference::ModelSelection>,
 }
 
 /// A short-lived host config that binds AIP reads to the model actor already
@@ -99,7 +99,7 @@ impl HostClient {
         self.token_file = token_file;
         self
     }
-    pub fn with_native_model(mut self,model:Option<crate::cadenza::ModelSelection>)->Self {self.native_model=model;self}
+    pub fn with_native_model(mut self,model:Option<crate::inference::ModelSelection>)->Self {self.native_model=model;self}
 
     pub fn with_max_output_bytes(mut self, bytes: usize) -> Result<Self, HostError> {
         if bytes == 0 {

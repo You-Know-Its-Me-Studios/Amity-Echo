@@ -1,10 +1,40 @@
 //! References only in configuration; secrets come from environment or OS vault.
 use anyhow::{Context, Result, bail, ensure};
 
+pub const DEVELOPMENT_REFERENCE: &str = "windows:Amity/Echo/Cadenza/development";
+
+/// Called only while Echo holds the development startup lock. A pre-existing
+/// credential is never replaced, including when a service refuses it.
+pub fn provision_development() -> Result<String> {
+    #[cfg(windows)]
+    {
+        let target = DEVELOPMENT_REFERENCE.strip_prefix("windows:").unwrap();
+        if let Some(secret) = vault::read_optional(target)? {
+            return Ok(secret);
+        }
+        let mut random = [0u8; 32];
+        getrandom::fill(&mut random).context("generating a development service credential")?;
+        let secret = random.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        vault::write(target, &secret)?;
+        Ok(secret)
+    }
+    #[cfg(not(windows))]
+    {
+        bail!("Automatic development credentials require a supported OS credential vault")
+    }
+}
+
+pub fn development_credential_exists() -> Result<bool> {
+    #[cfg(windows)]
+    { Ok(vault::read_optional(DEVELOPMENT_REFERENCE.strip_prefix("windows:").unwrap())?.is_some()) }
+    #[cfg(not(windows))]
+    { Ok(false) }
+}
+
 pub fn resolve(reference: &str) -> Result<String> {
     let secret = if let Some(name) = reference.strip_prefix("env:") {
         validate_env(name)?;
-        std::env::var(name).with_context(|| format!("Cadenza credential unavailable: set {name} or configure a Windows credential reference in /settings"))?
+        std::env::var(name).with_context(|| format!("Cadenza credential unavailable: environment variable {name} is not set"))?
     } else if let Some(target) = reference.strip_prefix("windows:") {
         vault::read(target)?
     } else {
@@ -29,11 +59,6 @@ pub fn validate_env(name: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn store_environment(name: &str, target: &str) -> Result<()> {
-    let secret = resolve(&format!("env:{name}"))?;
-    vault::write(target, &secret)
-}
-
 #[cfg(windows)]
 mod vault {
     use super::*;
@@ -48,14 +73,17 @@ mod vault {
         Ok(s.encode_utf16().chain(Some(0)).collect())
     }
     pub fn read(name: &str) -> Result<String> {
+        read_optional(name)?.context("Cadenza credential is missing from Windows Credential Manager")
+    }
+    pub fn read_optional(name: &str) -> Result<Option<String>> {
         let name = target(name)?;
         let mut credential = std::ptr::null_mut();
         // Win32 owns this allocation until CredFree; length is validated before a slice is formed.
         unsafe {
             if CredReadW(name.as_ptr(), CRED_TYPE_GENERIC, 0, &mut credential) == 0 {
-                bail!(
-                    "Cadenza credential is missing from Windows Credential Manager; configure it in /settings"
-                );
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(1168) { return Ok(None); }
+                return Err(error).context("reading Cadenza credential from Windows Credential Manager");
             }
             ensure!(
                 !credential.is_null(),
@@ -74,7 +102,7 @@ mod vault {
                 .context("Cadenza vault credential is not UTF-8")
             })();
             CredFree(credential.cast());
-            result
+            result.map(Some)
         }
     }
     pub fn write(name: &str, secret: &str) -> Result<()> {

@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use tungstenite::{Message, WebSocket, protocol::WebSocketConfig, stream::MaybeTlsStream};
 
 const MAX_PAYLOAD: usize = 1024 * 1024;
+pub const PROTOCOL_VERSION: u32 = 1;
 static REQUEST: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -147,6 +148,7 @@ pub struct Client {
 }
 impl Client {
     pub fn connect(settings: &CadenzaSettings) -> Result<Self> {
+        crate::development::prepare(settings)?;
         let secret = crate::credentials::resolve(&settings.credential_ref)?;
         Self::connect_authenticated(settings, secret)
     }
@@ -205,11 +207,11 @@ impl Client {
             socket,
             timeout: Duration::from_secs(settings.request_timeout_seconds),
         };
-        client.send(json!({"type":"hello","versions":[1],"token":secret}))?;
+        client.send(json!({"type":"hello","versions":[PROTOCOL_VERSION],"token":secret}))?;
         let hello = client.next_event(Instant::now() + timeout)?;
         check_error(&hello)?;
         ensure!(
-            hello["type"] == "hello" && hello["version"] == 1,
+            hello["type"] == "hello" && hello["version"] == PROTOCOL_VERSION,
             "Cadenza/1 negotiation failed"
         );
         client.poll_timeout()?;
@@ -445,7 +447,7 @@ pub fn check_error(value: &Value) -> Result<()> {
         let code = value["code"].as_str().unwrap_or("unknown_error");
         if code == "authentication_or_version_failed" {
             bail!(
-                "Cadenza authentication or protocol negotiation failed; check the configured credential reference and Cadenza/1 support"
+                "Cadenza rejected the supplied credential or Cadenza/1 negotiation. If another service owns the endpoint, Echo will not change its credential"
             );
         }
         bail!(
@@ -688,7 +690,7 @@ mod tests {
             check_error(&json!({"type":"error","code":"authentication_or_version_failed"}))
                 .unwrap_err()
                 .to_string()
-                .contains("credential reference")
+                .contains("supplied credential")
         );
         assert!(check_error(&json!({"type":"error","code":"invalid_request","message":"context capacity exceeded","retryable":false})).unwrap_err().to_string().contains("context capacity"));
     }

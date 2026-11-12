@@ -18,7 +18,7 @@ pub struct Session {
     pub working_directory: Option<PathBuf>,
     pub model: Option<String>,
     #[serde(default)]
-    pub cadenza_model: Option<crate::cadenza::ModelSelection>,
+    pub cadenza_model: Option<crate::inference::ModelSelection>,
     #[serde(default)]
     pub model_history: Vec<ModelChange>,
     pub created_at_ms: u128,
@@ -66,7 +66,7 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn select_cadenza_model(&mut self, model: crate::cadenza::ModelSelection) {
+    pub fn select_cadenza_model(&mut self, model: crate::inference::ModelSelection) {
         if self.model_history.is_empty() {
             if let Some(previous)=&self.model { self.model_history.push(ModelChange {message_index:0,label:previous.clone(),root:self.cadenza_model.as_ref().map(|m|m.root.clone())}); }
         }
@@ -142,7 +142,7 @@ impl SessionStore {
         Ok(Self { dir: config.session_dir.clone() })
     }
 
-    pub fn create(&self, project_id: &str, model: Option<crate::cadenza::ModelSelection>) -> io::Result<Session> {
+    pub fn create(&self, project_id: &str, model: Option<crate::inference::ModelSelection>) -> io::Result<Session> {
         if project_id.trim().is_empty() {
             return Err(invalid("session project ID cannot be empty"));
         }
