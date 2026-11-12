@@ -38,11 +38,14 @@ jobs:
             throw "VS Code extension version $editorVersion does not match Cargo version $version"
           }
 
-      - name: Build Windows CLI
+      - name: Build and test Windows CLI
         shell: pwsh
         run: |
           rustup toolchain install 1.95.0 --profile minimal
           cargo +1.95.0 build --release --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw "Windows CLI build failed" }
+          cargo +1.95.0 test --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw "Windows CLI tests failed" }
 
       - name: Fetch pinned Amity host package
         shell: pwsh
@@ -88,10 +91,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          $notes = "docs/releases/$env:GITHUB_REF_NAME.md"
+          $notesArguments = @("--generate-notes")
+          if (Test-Path -LiteralPath $notes) { $notesArguments = @("--notes-file", $notes) }
           gh release create $env:GITHUB_REF_NAME `
             ./echocli-x86_64-pc-windows-msvc.exe `
             ./echocli-x86_64-pc-windows-msvc.exe.sha256 `
             ./amity-x86_64-pc-windows-msvc.exe `
             ./amity-x86_64-pc-windows-msvc.exe.sha256 `
             ./amity-echo-editor.vsix `
-            --verify-tag --latest --title "Amity Echo $env:GITHUB_REF_NAME" --generate-notes
+            --verify-tag --latest --title "Amity Echo $env:GITHUB_REF_NAME" @notesArguments
+          if ($LASTEXITCODE -ne 0) { throw "GitHub Release publication failed" }
