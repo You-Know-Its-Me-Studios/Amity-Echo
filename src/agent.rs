@@ -48,6 +48,7 @@ impl Agent<'_> {
         let path = project.effective_host_config()?.to_path_buf();
         HostClient::new(self.config.host_executable.clone(), path,
             Duration::from_secs(self.config.resources.host_timeout_seconds))
+            .map(|host| host.with_token_file(project.token_file.clone()))
             .context("configuring Amity host")
     }
 
@@ -1609,7 +1610,9 @@ impl Agent<'_> {
     }
 
     pub fn status(&mut self) -> Result<()> {
-        self.events.context(&self.session.project_id, &self.session.id,
+        let name = self.config.projects.iter().find(|project| project.id == self.session.project_id)
+            .map(|project| project.name.as_str()).unwrap_or(&self.session.project_id);
+        self.events.context(name, &self.session.id,
             self.session.model.as_deref().unwrap_or("default"));
         if self.session.usage_input_tokens > 0 || self.session.usage_output_tokens > 0 {
             let mut usage = format!("Model usage: {} input · {} output tokens",

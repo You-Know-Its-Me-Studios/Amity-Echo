@@ -15,6 +15,8 @@ const REPOSITORY: &str = "You-Know-Its-Me-Studios/Amity-Echo";
 const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/You-Know-Its-Me-Studios/Amity-Echo/releases/latest";
 const EXECUTABLE_ASSET: &str = "echocli-x86_64-pc-windows-msvc.exe";
 const CHECKSUM_ASSET: &str = "echocli-x86_64-pc-windows-msvc.exe.sha256";
+const HOST_ASSET: &str = "amity-x86_64-pc-windows-msvc.exe";
+const HOST_CHECKSUM_ASSET: &str = "amity-x86_64-pc-windows-msvc.exe.sha256";
 const MAX_EXECUTABLE_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Deserialize)]
@@ -49,6 +51,10 @@ pub fn run(check_only: bool) -> Result<()> {
         .with_context(|| format!("release {} has no checksum asset", release.tag_name))?;
     println!("Installed: {current_version}  Latest: {remote_version}");
     if remote_version <= current_version {
+        if !check_only && release.assets.iter().any(|asset| asset.name == HOST_ASSET)
+            && !host_helper_path().is_file() {
+            install_host_helper(&client, &release)?;
+        }
         println!("Echo is up to date.");
         return Ok(());
     }
@@ -74,12 +80,65 @@ pub fn run(check_only: bool) -> Result<()> {
     download_asset(&client, &release.tag_name, CHECKSUM_ASSET, &checksum,
         checksum_asset.size, 4096)?;
     println!("Verifying release SHA-256...");
-    verify_checksum(&executable, &checksum, executable_asset.digest.as_deref())?;
+    verify_checksum(&executable, &checksum, EXECUTABLE_ASSET,
+        executable_asset.digest.as_deref())?;
+    if release.assets.iter().any(|asset| asset.name == HOST_ASSET) {
+        install_host_helper(&client, &release)?;
+    }
     println!("Installing Echo {remote_version}...");
     self_replace::self_replace(&executable)
         .context("replacing the Echo executable; ensure its install directory is writable")?;
     println!("Updated Echo from {current_version} to {remote_version}. Start echocli again to use it.");
     Ok(())
+}
+
+pub fn ensure_host_helper() -> Result<PathBuf> {
+    ensure!(cfg!(all(target_os = "windows", target_arch = "x86_64", target_env = "msvc")),
+        "automatic Amity host installation currently supports Windows x64 MSVC only");
+    let path = host_helper_path();
+    if path.is_file() { return Ok(path); }
+    let client = client(Duration::from_secs(120));
+    let release = fetch_release(&client)?;
+    ensure!(release_version(&release)? == installed_version()?,
+        "a newer Echo release is available; run `echocli update` before /init");
+    install_host_helper(&client, &release)
+}
+
+fn host_helper_path() -> std::path::PathBuf {
+    crate::config::Config::home_dir().join("bin").join(if cfg!(windows) { "amity.exe" } else { "amity" })
+}
+
+fn install_host_helper(client: &ureq::Agent, release: &Release) -> Result<PathBuf> {
+    let asset = release.assets.iter().find(|asset| asset.name == HOST_ASSET)
+        .context("this Echo release has no Amity host executable")?;
+    let checksum_asset = release.assets.iter().find(|asset| asset.name == HOST_CHECKSUM_ASSET)
+        .context("this Echo release has no Amity host checksum")?;
+    let target = host_helper_path();
+    let directory = target.parent().context("Amity installation directory is missing")?;
+    fs::create_dir_all(directory).context("creating local Amity installation directory")?;
+    let temporary = tempfile::tempdir_in(directory).context("creating temporary Amity installation directory")?;
+    let downloaded = temporary.path().join(HOST_ASSET);
+    let checksum = temporary.path().join(HOST_CHECKSUM_ASSET);
+    download_asset(client, &release.tag_name, HOST_ASSET, &downloaded,
+        asset.size, MAX_EXECUTABLE_BYTES)?;
+    download_asset(client, &release.tag_name, HOST_CHECKSUM_ASSET, &checksum,
+        checksum_asset.size, 4096)?;
+    verify_checksum(&downloaded, &checksum, HOST_ASSET, asset.digest.as_deref())?;
+    if target.exists() {
+        let backup = temporary.path().join("amity.previous.exe");
+        fs::rename(&target, &backup).context("moving the previous Amity host aside")?;
+        if let Err(error) = fs::rename(&downloaded, &target) {
+            if fs::rename(&backup, &target).is_err() {
+                let saved = temporary.keep();
+                anyhow::bail!("Amity installation failed ({error}); previous host is in {}",
+                    saved.display());
+            }
+            return Err(error).context("installing updated Amity host");
+        }
+    } else {
+        fs::rename(&downloaded, &target).context("installing Amity host")?;
+    }
+    Ok(target)
 }
 
 /// A short, read-only check for the interactive header. It never downloads an asset.
@@ -145,13 +204,14 @@ fn download_asset(client: &ureq::Agent, tag: &str, name: &str, path: &Path,
     Ok(())
 }
 
-fn verify_checksum(executable: &Path, checksum: &Path, github_digest: Option<&str>) -> Result<()> {
+fn verify_checksum(executable: &Path, checksum: &Path, asset_name: &str,
+    github_digest: Option<&str>) -> Result<()> {
     let expected = fs::read_to_string(checksum)
         .with_context(|| format!("reading release checksum {}", checksum.display()))?;
     let mut fields = expected.split_whitespace();
     let expected_hash = fields.next().context("release checksum is empty")?;
     let expected_name = fields.next().context("release checksum has no asset name")?;
-    ensure!(fields.next().is_none() && expected_name == EXECUTABLE_ASSET
+    ensure!(fields.next().is_none() && expected_name == asset_name
         && expected_hash.len() == 64 && expected_hash.bytes().all(|byte| byte.is_ascii_hexdigit()),
         "release checksum has an invalid format");
 

@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
@@ -38,7 +39,10 @@ pub struct ProjectRegistration {
     pub id: String,
     pub name: String,
     pub path: PathBuf,
-    pub host_config: PathBuf,
+    #[serde(default)]
+    pub host_config: Option<PathBuf>,
+    #[serde(default)]
+    pub token_file: Option<PathBuf>,
     #[serde(default)]
     pub models: Vec<ModelProfile>,
     #[serde(default)]
@@ -47,11 +51,15 @@ pub struct ProjectRegistration {
 
 impl ProjectRegistration {
     pub fn effective_host_config(&self) -> io::Result<&Path> {
+        let base = self.host_config.as_deref().ok_or_else(|| invalid(format!(
+            "Amity is not initialized for this workspace ({}). Run /init here to enable governed coding operations",
+            self.path.display()
+        )))?;
         let path = match self.selected_model.as_deref() {
             Some(name) => self.models.iter().find(|model| model.name == name)
                 .map(|model| model.host_config.as_path())
                 .ok_or_else(|| invalid(format!("model profile '{name}' is not configured for {}", self.name))),
-            None => Ok(self.host_config.as_path()),
+            None => Ok(base),
         }?;
         canonical_host_config(path, &self.id, &self.path)?;
         Ok(path)
@@ -151,6 +159,10 @@ impl Config {
 
     pub fn path() -> PathBuf { Self::home_dir().join("config.json") }
 
+    pub fn local_token_path(project_id: &str) -> PathBuf {
+        Self::home_dir().join("secrets").join(format!("{project_id}.token"))
+    }
+
     pub fn load() -> io::Result<Self> {
         let path = Self::path();
         match fs::read(&path) {
@@ -190,8 +202,38 @@ impl Config {
     pub fn discover_project(&self, cwd: &Path) -> Option<&ProjectRegistration> {
         let cwd = cwd.canonicalize().ok()?;
         self.projects.iter()
-            .filter(|project| cwd.starts_with(&project.path))
-            .max_by_key(|project| project.path.components().count())
+            .filter(|project| project.path == cwd)
+            .max_by_key(|project| project.host_config.is_some())
+    }
+
+    /// The terminal's working directory is an Echo project even before an
+    /// Amity host has been configured for governed operations.
+    pub fn select_working_directory(&mut self, cwd: &Path) -> io::Result<&ProjectRegistration> {
+        let path = canonical_dir(cwd)?;
+        if let Some(id) = self.discover_project(&path).map(|project| project.id.clone()) {
+            self.active_project = Some(id.clone());
+            return Ok(self.projects.iter().find(|project| project.id == id)
+                .expect("discovered project exists"));
+        }
+        let key = if cfg!(windows) {
+            path.to_string_lossy().to_lowercase()
+        } else {
+            path.to_string_lossy().into_owned()
+        };
+        let digest = format!("{:x}", Sha256::digest(key.as_bytes()));
+        let id = format!("workspace-{}", &digest[..32]);
+        if self.projects.iter().any(|project| project.id == id && project.path != path) {
+            return Err(invalid("workspace identity collision"));
+        }
+        let name = path.file_name().map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        self.projects.push(ProjectRegistration {
+            id: id.clone(), name, path, host_config: None,
+            token_file: None,
+            models: Vec::new(), selected_model: None,
+        });
+        self.active_project = Some(id.clone());
+        Ok(self.projects.last().expect("workspace was registered"))
     }
 
     pub fn register_project(&mut self, path: impl AsRef<Path>, host_config: impl AsRef<Path>) -> io::Result<&ProjectRegistration> {
@@ -212,11 +254,12 @@ impl Config {
         let name = path.file_name().map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| id.clone());
         if let Some(existing) = self.projects.iter_mut().find(|project| project.id == id) {
-            existing.host_config = config_path;
+            existing.host_config = Some(config_path);
             existing.name = name;
         } else {
             self.projects.push(ProjectRegistration {
-                id: id.clone(), name, path, host_config: config_path,
+                id: id.clone(), name, path, host_config: Some(config_path),
+                token_file: None,
                 models: Vec::new(), selected_model: None,
             });
         }

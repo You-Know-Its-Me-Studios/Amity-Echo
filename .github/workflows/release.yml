@@ -44,6 +44,21 @@ jobs:
           rustup toolchain install 1.95.0 --profile minimal
           cargo +1.95.0 build --release --locked --target x86_64-pc-windows-msvc
 
+      - name: Check out matching Amity host
+        uses: actions/checkout@v7.0.1
+        with:
+          repository: You-Know-Its-Me-Studios/Amity-AI
+          ref: dc07e7bbaa9bb0cbdc807c700ed973f3450c1e29
+          path: amity-backend
+          persist-credentials: false
+
+      - name: Build Windows Amity host
+        shell: pwsh
+        run: |
+          Push-Location amity-backend
+          cargo +1.95.0 build --release --locked --target x86_64-pc-windows-msvc --bin amity
+          Pop-Location
+
       - name: Set up Node.js for VS Code extension
         uses: actions/setup-node@v4
         with:
@@ -64,6 +79,10 @@ jobs:
           Copy-Item -LiteralPath "target/x86_64-pc-windows-msvc/release/echocli.exe" -Destination $asset
           $digest = (Get-FileHash -LiteralPath $asset -Algorithm SHA256).Hash.ToLowerInvariant()
           Set-Content -LiteralPath "$asset.sha256" -Encoding ascii -Value "$digest  $asset"
+          $hostAsset = "amity-x86_64-pc-windows-msvc.exe"
+          Copy-Item -LiteralPath "amity-backend/target/x86_64-pc-windows-msvc/release/amity.exe" -Destination $hostAsset
+          $hostDigest = (Get-FileHash -LiteralPath $hostAsset -Algorithm SHA256).Hash.ToLowerInvariant()
+          Set-Content -LiteralPath "$hostAsset.sha256" -Encoding ascii -Value "$hostDigest  $hostAsset"
 
       - name: Publish GitHub Release
         shell: pwsh
@@ -73,5 +92,7 @@ jobs:
           gh release create $env:GITHUB_REF_NAME `
             ./echocli-x86_64-pc-windows-msvc.exe `
             ./echocli-x86_64-pc-windows-msvc.exe.sha256 `
+            ./amity-x86_64-pc-windows-msvc.exe `
+            ./amity-x86_64-pc-windows-msvc.exe.sha256 `
             ./amity-echo-editor.vsix `
             --verify-tag --latest --title "Amity Echo $env:GITHUB_REF_NAME" --generate-notes

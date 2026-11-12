@@ -62,6 +62,7 @@ impl HostResponse {
 pub struct HostClient {
     executable: PathBuf,
     config_path: PathBuf,
+    token_file: Option<PathBuf>,
     timeout: Duration,
     max_output_bytes: usize,
 }
@@ -89,7 +90,13 @@ impl HostClient {
         if timeout.is_zero() {
             return Err(HostError::Configuration("Amity command timeout must be positive".into()));
         }
-        Ok(Self { executable, config_path, timeout, max_output_bytes: DEFAULT_OUTPUT_LIMIT })
+        Ok(Self { executable, config_path, token_file: None, timeout,
+            max_output_bytes: DEFAULT_OUTPUT_LIMIT })
+    }
+
+    pub fn with_token_file(mut self, token_file: Option<PathBuf>) -> Self {
+        self.token_file = token_file;
+        self
     }
 
     pub fn with_max_output_bytes(mut self, bytes: usize) -> Result<Self, HostError> {
@@ -136,6 +143,7 @@ impl HostClient {
         drop(file);
         let mut client = Self::new(self.executable.clone(), path.clone(), self.timeout)?;
         client.max_output_bytes = self.max_output_bytes;
+        client.token_file = self.token_file.clone();
         Ok(ModelScopedHost { client, config_path: path })
     }
 
@@ -152,8 +160,13 @@ impl HostClient {
         if cancel.load(Ordering::Relaxed) {
             return Err(HostError::Cancelled(format!("Amity {command} was cancelled")));
         }
-        let token = std::env::var("AMITY_HOST_TOKEN")
-            .map_err(|_| HostError::Configuration("AMITY_HOST_TOKEN is required for the configured Amity host".into()))?;
+        let token = if let Some(path) = &self.token_file {
+            fs::read_to_string(path).map(|value| value.trim().to_owned()).map_err(|error|
+                HostError::Configuration(format!("Could not read the local Amity credential: {error}")))?
+        } else {
+            std::env::var("AMITY_HOST_TOKEN").map_err(|_| HostError::Configuration(
+                "AMITY_HOST_TOKEN is required for this Amity connection".into()))?
+        };
         if token.is_empty() {
             return Err(HostError::Configuration("AMITY_HOST_TOKEN is empty".into()));
         }

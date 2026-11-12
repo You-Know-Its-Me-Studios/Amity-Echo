@@ -14,6 +14,7 @@ mod state;
 mod subagents;
 mod terminal;
 mod update;
+mod workspace;
 
 use agent::Agent;
 use anyhow::{Context, Result, bail};
@@ -91,12 +92,11 @@ fn run() -> Result<()> {
             }
         }
     }
-    if let Some(project) = config.discover_project(&cwd) {
-        let id = project.id.clone();
-        if config.active_project.as_deref() != Some(&id) {
-            config.active_project = Some(id);
-            config.save()?;
-        }
+    let old_project = config.active_project.clone();
+    let old_count = config.projects.len();
+    config.select_working_directory(&cwd)?;
+    if config.active_project != old_project || config.projects.len() != old_count {
+        config.save()?;
     }
 
     let store = SessionStore::new(&config).context("opening Echo conversations")?;
@@ -128,9 +128,7 @@ fn run() -> Result<()> {
     match args.as_slice() {
         [] => {
             terminal.enter_interactive(&cwd)?;
-            let mut session = if config.active_project().is_some() {
-                Some(current_session(&config, &store)?)
-            } else { None };
+            let mut session = Some(current_session(&config, &store)?);
             if let Some(current) = session.as_mut() {
                 attach_inputs(current, &store, &config, &attachment_paths,
                     editor_context_path.as_deref())?;
@@ -145,7 +143,7 @@ fn run() -> Result<()> {
         }
         [command] if command == "status" => {
             if config.active_project().is_none() {
-                terminal.info("No project is connected. Open Echo and choose /project to connect one.");
+                terminal.info("Echo could not select the current working directory.");
                 return Ok(());
             }
             let mut session = current_session(&config, &store)?;
@@ -166,7 +164,7 @@ fn run() -> Result<()> {
         _ => {
             let instruction = args.join(" ");
             if config.active_project().is_none() {
-                bail!("No project is connected. Open `echocli`, choose /project, and connect an Amity project.");
+                bail!("Echo could not select the current working directory");
             }
             let mut session = current_session(&config, &store)?;
             attach_inputs(&mut session, &store, &config, &attachment_paths,
@@ -192,7 +190,7 @@ fn attach_inputs(session: &mut Session, store: &SessionStore, config: &Config,
 }
 
 fn active_project(config: &Config) -> Result<&config::ProjectRegistration> {
-    config.active_project().context("No project is connected. Open Echo and choose /project.")
+    config.active_project().context("Echo could not select the current working directory")
 }
 
 fn current_session(config: &Config, store: &SessionStore) -> Result<Session> {
@@ -209,13 +207,15 @@ fn current_session(config: &Config, store: &SessionStore) -> Result<Session> {
 fn interactive(config: &mut Config, store: &SessionStore, terminal: &mut Terminal,
     cancel: &AtomicBool, mut session: Option<Session>) -> Result<()> {
     let mut steward = StewardMonitor::new(config);
-    show_session(terminal, session.as_ref());
+    show_session(config, terminal, session.as_ref());
     if let Some(current) = session.as_mut() {
         resume_pending(config, store, terminal, cancel, current);
     }
     loop {
         cancel.store(false, Ordering::Relaxed);
-        let project_label = session.as_ref().map(|value| value.project_id.as_str()).unwrap_or("Local workspace");
+        let project_label = session.as_ref()
+            .and_then(|value| config.projects.iter().find(|project| project.id == value.project_id))
+            .map(|project| project.name.as_str()).unwrap_or("Local workspace");
         let session_label = session.as_ref().map(|value| value.id.as_str()).unwrap_or("new");
         let input = terminal.read_line(project_label, session_label)?;
         let line = match input {
@@ -232,11 +232,31 @@ fn interactive(config: &mut Config, store: &SessionStore, terminal: &mut Termina
             let result = match command.id {
                 Command::Help => terminal.show_help(COMMANDS),
                 Command::Exit => return Ok(()),
+                Command::Init => {
+                    (|| -> Result<()> {
+                        let cwd = env::current_dir()?;
+                        let project = config.select_working_directory(&cwd)?.clone();
+                        config.save()?;
+                        session = Some(current_session(config, store)?);
+                        show_session(config, terminal, session.as_ref());
+                        if workspace::initialize(config, &project)? {
+                            terminal.info(&format!("Amity is ready in {}. Choose /model if an AI model is not configured.",
+                                project.path.display()));
+                        } else {
+                            if project.path.join(".amity").is_dir() {
+                                terminal.info("Amity is already initialized for this folder.");
+                            } else {
+                                terminal.info("This project already uses an existing Amity connection. /init left it unchanged.");
+                            }
+                        }
+                        Ok(())
+                    })()
+                }
                 Command::Project => {
                     (|| -> Result<()> {
                         if choose_project(config, terminal)? {
                             session = Some(current_session(config, store)?);
-                            show_session(terminal, session.as_ref());
+                            show_session(config, terminal, session.as_ref());
                             if let Some(current) = session.as_mut() {
                                 resume_pending(config, store, terminal, cancel, current);
                             }
@@ -249,7 +269,7 @@ fn interactive(config: &mut Config, store: &SessionStore, terminal: &mut Termina
                         if let Some(next) = browse_session(config, store, terminal)? {
                             select_session_project(config, &next)?;
                             session = Some(next);
-                            show_session(terminal, session.as_ref());
+                            show_session(config, terminal, session.as_ref());
                             if let Some(current) = session.as_mut() {
                                 resume_pending(config, store, terminal, cancel, current);
                             }
@@ -261,9 +281,9 @@ fn interactive(config: &mut Config, store: &SessionStore, terminal: &mut Termina
                     (|| -> Result<()> {
                         if let Some(project) = config.active_project() {
                             session = Some(store.create(&project.id, project.selected_model.clone())?);
-                            show_session(terminal, session.as_ref());
+                            show_session(config, terminal, session.as_ref());
                         } else {
-                            terminal.info("Connect a project with /project before starting a conversation.");
+                            terminal.info("Echo could not select the current working directory.");
                         }
                         Ok(())
                     })()
@@ -272,14 +292,14 @@ fn interactive(config: &mut Config, store: &SessionStore, terminal: &mut Termina
                     if let Some(current) = session.as_mut() {
                         choose_model(config, store, terminal, current)
                     } else {
-                        terminal.info("Connect a project with /project before choosing a model.");
+                        terminal.info("Echo could not select the current working directory.");
                         Ok(())
                     }
                 }
                 Command::Attach => {
                     (|| -> Result<()> {
                         let Some(current) = session.as_mut() else {
-                            terminal.info("Connect a project with /project before attaching a file.");
+                            terminal.info("Echo could not select the current working directory.");
                             return Ok(());
                         };
                         let Some(path) = terminal.prompt_text("Image or text file to attach")? else { return Ok(()); };
@@ -300,7 +320,7 @@ fn interactive(config: &mut Config, store: &SessionStore, terminal: &mut Termina
                             cancel, interactive: true };
                         agent.status()
                     } else {
-                        terminal.info("Echo is ready. Connect a project with /project to start coding.");
+                        terminal.info("Echo is ready in this workspace.");
                         Ok(())
                     }
                 }
@@ -310,7 +330,7 @@ fn interactive(config: &mut Config, store: &SessionStore, terminal: &mut Termina
                             cancel, interactive: true };
                         agent.review()
                     } else {
-                        terminal.info("No changes to review. Connect a project with /project.");
+                        terminal.info("There are no changes to review in this workspace.");
                         Ok(())
                     }
                 }
@@ -334,7 +354,7 @@ fn interactive(config: &mut Config, store: &SessionStore, terminal: &mut Termina
                 }
             };
             if let Err(error) = result { terminal.error(&format!("{error:#}")); }
-            if matches!(command.id, Command::Project | Command::Sessions | Command::Settings) {
+            if matches!(command.id, Command::Init | Command::Project | Command::Sessions | Command::Settings) {
                 steward.restart(config);
             }
             continue;
@@ -351,7 +371,7 @@ fn interactive(config: &mut Config, store: &SessionStore, terminal: &mut Termina
                 steward.restart(config);
             }
         } else {
-            terminal.info("Connect a project with /project, then send your request again.");
+            terminal.info("Echo could not open a conversation for this working directory.");
         }
     }
 }
@@ -382,10 +402,12 @@ impl Drop for StewardMonitor {
     }
 }
 
-fn show_session(terminal: &Terminal, session: Option<&Session>) {
+fn show_session(config: &Config, terminal: &Terminal, session: Option<&Session>) {
     if let Some(session) = session {
-        terminal.context(&session.project_id, &session.id, session.model.as_deref().unwrap_or("default"));
         terminal.load_session(session);
+        let name = config.projects.iter().find(|project| project.id == session.project_id)
+            .map(|project| project.name.as_str()).unwrap_or(&session.project_id);
+        terminal.context(name, &session.id, session.model.as_deref().unwrap_or("not configured"));
     } else {
         terminal.banner("Local workspace", "new", "not connected");
     }
@@ -432,8 +454,8 @@ fn choose_project(config: &mut Config, terminal: &mut Terminal) -> Result<bool> 
         description: format!("{}{}", project.path.display(),
             if config.active_project.as_deref() == Some(&project.id) { "  ·  current" } else { "" }),
     }).collect();
-    options.push(MenuChoice { command: "Connect a project".into(),
-        description: "Choose its Amity connection file".into() });
+    options.push(MenuChoice { command: "Use an existing Amity connection".into(),
+        description: "Enable governed coding in a configured workspace".into() });
     let Some(index) = terminal.choose_option("Choose a project", &options)? else { return Ok(false); };
     if index == config.projects.len() {
         let Some(path) = terminal.prompt_text("Path to this project's Amity connection JSON file")? else {
@@ -467,7 +489,12 @@ fn select_session_project(config: &mut Config, session: &Session) -> Result<()> 
 
 fn choose_model(config: &mut Config, store: &SessionStore, terminal: &mut Terminal,
     session: &mut Session) -> Result<()> {
-    let models = active_project(config)?.models.clone();
+    let project = active_project(config)?;
+    if project.host_config.is_none() {
+        terminal.info("This folder is already your Echo project. Run /init once to enable its Amity connection, then choose a model.");
+        return Ok(());
+    }
+    let models = project.models.clone();
     let mut options = vec![MenuChoice {
         command: "Project default".into(),
         description: if session.model.is_none() { "Current model".into() }
@@ -499,7 +526,8 @@ fn choose_model(config: &mut Config, store: &SessionStore, terminal: &mut Termin
         }).collect::<Vec<_>>();
         let Some(chosen) = terminal.choose_option("Choose a local model", &choices)? else { return Ok(()); };
         let name = names[chosen].clone();
-        let source = active_project(&next_config)?.host_config.clone();
+        let source = active_project(&next_config)?.host_config.clone()
+            .context("This workspace has no Amity model connection")?;
         let mut binding: serde_json::Value = serde_json::from_slice(&std::fs::read(source)?)?;
         let fields = binding.as_object_mut().context("Amity connection is not a JSON object")?;
         fields.insert("model_command".into(), serde_json::json!(env::current_exe()?));
@@ -536,7 +564,8 @@ fn choose_model(config: &mut Config, store: &SessionStore, terminal: &mut Termin
         let digest = format!("{:x}", Sha256::digest(format!("{}:{}:{model_id}",
             active_project(&next_config)?.id, endpoint.trim()).as_bytes()));
         let profile_name = format!("API: {model_id} [{}]", &digest[..8]);
-        let source = active_project(&next_config)?.host_config.clone();
+        let source = active_project(&next_config)?.host_config.clone()
+            .context("This workspace has no Amity model connection")?;
         let mut binding: serde_json::Value = serde_json::from_slice(&std::fs::read(source)?)?;
         let fields = binding.as_object_mut().context("Amity connection is not a JSON object")?;
         fields.insert("model_command".into(), serde_json::json!(env::current_exe()?));
@@ -707,7 +736,7 @@ fn configure_capabilities(config: &mut Config, terminal: &mut Terminal) -> Resul
     }
     if choice == 1 {
         let Some(project) = &project else {
-            terminal.info("Connect a project with /project before changing experience retention.");
+            terminal.info("Echo could not select the current working directory.");
             return Ok(false);
         };
         let setting = &mut config.capabilities["projects"][project.id.as_str()]
@@ -781,7 +810,9 @@ fn configure_mcp(config: &mut Config, terminal: &mut Terminal) -> Result<bool> {
         terminal.info("Connect a project before adding an MCP service.");
         return Ok(false);
     };
-    let base: serde_json::Value = serde_json::from_slice(&std::fs::read(&project.host_config)?)?;
+    let host_config = project.host_config.as_ref()
+        .context("Amity is not configured for this workspace")?;
+    let base: serde_json::Value = serde_json::from_slice(&std::fs::read(host_config)?)?;
     let servers = base.get("mcp_servers").and_then(serde_json::Value::as_array)
         .cloned().unwrap_or_default();
     let mut options = vec![MenuChoice { command:"Connect MCP service".into(),
@@ -818,7 +849,8 @@ fn configure_mcp(config: &mut Config, terminal: &mut Terminal) -> Result<bool> {
         (true, id, None)
     };
     let project = config.active_project_mut().context("No project is selected")?;
-    let mut bindings = vec![(None, project.host_config.clone())];
+    let mut bindings = vec![(None, project.host_config.clone()
+        .context("Amity is not configured for this workspace")?)];
     bindings.extend(project.models.iter().enumerate()
         .map(|(index, profile)| (Some(index), profile.host_config.clone())));
     for (index, source) in bindings {
@@ -835,7 +867,7 @@ fn configure_mcp(config: &mut Config, terminal: &mut Terminal) -> Result<bool> {
         let path = Config::home_dir().join("connections").join(format!("mcp-{digest}.json"));
         state::write_json_atomic(&path, &binding)?;
         if let Some(index) = index { project.models[index].host_config = path; }
-        else { project.host_config = path; }
+        else { project.host_config = Some(path); }
     }
     terminal.info(if remove { "MCP service removed." } else { "MCP service saved. Echo will discover its tools when needed." });
     Ok(true)

@@ -559,7 +559,8 @@ fn workforce(ctx: &mut CapabilityContext<'_>, action: &str, input: &Value) -> Re
                 project.select_model(Some(&model_name))?;
                 let path = project.effective_host_config()?.to_path_buf();
                 let host = HostClient::new(ctx.config.host_executable.clone(), path.clone(),
-                    Duration::from_secs(ctx.config.resources.host_timeout_seconds))?;
+                    Duration::from_secs(ctx.config.resources.host_timeout_seconds))?
+                    .with_token_file(project.token_file.clone());
                 let model = ChatModel::open(&project, &path, Duration::from_secs(120))?;
                 Some((host, model))
             };

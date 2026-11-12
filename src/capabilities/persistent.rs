@@ -184,7 +184,8 @@ fn inspect_project(config: &Config, project: &ProjectRegistration, cancel: &Atom
     let path = project_path("stewardship", &project.id);
     let previous = read_record(&path)?;
     let host = HostClient::new(config.host_executable.clone(), project.effective_host_config()?.to_path_buf(),
-        Duration::from_secs(config.resources.host_timeout_seconds))?;
+        Duration::from_secs(config.resources.host_timeout_seconds))?
+        .with_token_file(project.token_file.clone());
     if cancel.load(Ordering::Relaxed) { bail!("project monitoring cancelled"); }
     let status = host.project_status()?;
     let head = status.pointer("/result/head/fingerprint").and_then(Value::as_str).unwrap_or("");
