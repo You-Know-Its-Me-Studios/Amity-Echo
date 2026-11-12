@@ -44,6 +44,8 @@ pub trait AgentEventSink {
     fn begin_busy(&mut self) -> Result<()> { Ok(()) }
     fn poll_busy(&mut self) -> Option<BusyInput> { None }
     fn end_busy(&mut self) -> Result<()> { Ok(()) }
+    fn begin_model_thinking(&mut self) -> Result<()> { Ok(()) }
+    fn end_model_thinking(&mut self) -> Result<()> { Ok(()) }
 
     fn request_approval(&mut self, description: &str) -> Result<bool> {
         self.emit(AgentEvent::ApprovalRequested { description: description.into() });

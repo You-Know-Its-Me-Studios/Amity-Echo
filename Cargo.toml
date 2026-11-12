@@ -1,6 +1,6 @@
 [package]
 name = "amity-echo"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 description = "Amity Echo, the first-party terminal coding agent for Amity"
 

@@ -7,11 +7,11 @@ use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use crossterm::{execute, queue};
-use crossterm::cursor::{Hide, MoveTo, Show};
+use crossterm::cursor::{Hide, MoveTo, RestorePosition, SavePosition, Show};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::style::{Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor};
 use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
@@ -75,6 +75,36 @@ const ECHO_LOGO_SMALL: &[&str] = &[
     "    .:-::..          .:-=+=:",
 ];
 
+// Decorative model-thinking messages. Keep this collection independent of model
+// context, conversation state, and engineering progress events.
+const MODEL_THINKING_MESSAGES: [&str; 21] = [
+    "Finding Where the Sidewalk Ends...",
+    "Knocking on the Witch's Wardrobe...",
+    "Downloading Data's Data...",
+    "Burning Off the Part of the Lost City...",
+    "Accidentally Shrinking My Children...",
+    "Checking to See if That's Real Tomato Ketchup...",
+    "Weighing Your Heart Against the Feather of Ma'at...",
+    "Asking Treebeard Whose Side He's On...",
+    "Checking to See if 2+2=4...",
+    "Wondering Why My Human Failed Me...",
+    "Wondering Why I've Got Red on Me...",
+    "Considering a New Job...",
+    "Considering 'What IS Actually My Favorite Scary Movie'...",
+    "Pondering My Feet...",
+    "Looking for Fabrizio...",
+    "Chasing the Golden Snitch...",
+    "Redrawing the Sistine Chapel...",
+    "Asking George About the Rabbits...",
+    "Stealing the Frog's Tea...",
+    "Painting My Happy Trees...",
+    "Checking If It's a Beautiful Day in the Neighborhood...",
+];
+
+const MODEL_THINKING_FRAMES: [char; 4] = ['|', '/', '-', '\\'];
+const MODEL_THINKING_FRAME_INTERVAL: Duration = Duration::from_millis(125);
+const MODEL_THINKING_MESSAGE_INTERVAL: Duration = Duration::from_secs(5);
+
 pub struct Terminal {
     editor: Option<DefaultEditor>,
     history_path: PathBuf,
@@ -107,6 +137,7 @@ struct Screen {
     cursor: usize,
     scroll: usize,
     status: String,
+    model_thinking: ModelThinking,
     approval: bool,
     decision_prompt: Option<String>,
     raw: bool,
@@ -118,6 +149,99 @@ struct Screen {
     menu_dismissed: bool,
     update_version: Option<String>,
     text_prompt: bool,
+}
+
+struct ModelThinking {
+    active: bool,
+    deck: [usize; MODEL_THINKING_MESSAGES.len()],
+    next_card: usize,
+    current_card: Option<usize>,
+    frame: usize,
+    frame_at: Instant,
+    message_at: Instant,
+    random_state: u64,
+}
+
+impl ModelThinking {
+    fn new() -> Self {
+        let now = Instant::now();
+        let seed = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64
+            ^ u64::from(std::process::id());
+        let mut thinking = Self {
+            active: false,
+            deck: std::array::from_fn(|index| index),
+            next_card: MODEL_THINKING_MESSAGES.len(),
+            current_card: None,
+            frame: 0,
+            frame_at: now,
+            message_at: now,
+            random_state: if seed == 0 { 0x9e37_79b9_7f4a_7c15 } else { seed },
+        };
+        thinking.shuffle_deck();
+        thinking
+    }
+
+    fn random(&mut self) -> u64 {
+        self.random_state ^= self.random_state << 13;
+        self.random_state ^= self.random_state >> 7;
+        self.random_state ^= self.random_state << 17;
+        self.random_state
+    }
+
+    fn shuffle_deck(&mut self) {
+        for index in (1..self.deck.len()).rev() {
+            let other = (self.random() as usize) % (index + 1);
+            self.deck.swap(index, other);
+        }
+        if self.current_card == Some(self.deck[0]) {
+            self.deck.swap(0, 1);
+        }
+        self.next_card = 0;
+    }
+
+    fn next_message(&mut self) {
+        if self.next_card == self.deck.len() {
+            self.shuffle_deck();
+        }
+        self.current_card = Some(self.deck[self.next_card]);
+        self.next_card += 1;
+    }
+
+    fn begin(&mut self) {
+        if self.active { return; }
+        self.active = true;
+        self.frame = 0;
+        self.frame_at = Instant::now();
+        self.message_at = self.frame_at;
+        self.next_message();
+    }
+
+    fn end(&mut self) {
+        self.active = false;
+    }
+
+    fn tick(&mut self) -> bool {
+        if !self.active { return false; }
+        let now = Instant::now();
+        let mut changed = false;
+        if now.duration_since(self.message_at) >= MODEL_THINKING_MESSAGE_INTERVAL {
+            self.next_message();
+            self.message_at = now;
+            changed = true;
+        }
+        if now.duration_since(self.frame_at) >= MODEL_THINKING_FRAME_INTERVAL {
+            self.frame = (self.frame + 1) % MODEL_THINKING_FRAMES.len();
+            self.frame_at = now;
+            changed = true;
+        }
+        changed
+    }
+
+    fn label(&self) -> Option<String> {
+        if !self.active { return None; }
+        let message = MODEL_THINKING_MESSAGES[*self.current_card.as_ref()?];
+        Some(format!("{} {message}", MODEL_THINKING_FRAMES[self.frame]))
+    }
 }
 
 impl Terminal {
@@ -159,7 +283,8 @@ impl Terminal {
             cwd: cwd.to_path_buf(), project: "Local workspace".into(), session: "new".into(),
             model: "not connected".into(), lines: Vec::new(),
             stream_start: None, stream_buffer: String::new(), input: String::new(),
-            cursor: 0, scroll: 0, status: "Ready".into(), approval: false,
+            cursor: 0, scroll: 0, status: "Ready".into(), model_thinking: ModelThinking::new(),
+            approval: false,
             decision_prompt: None, raw: false,
             history: Vec::new(), history_position: None, saved_draft: String::new(),
             engaged: false,
@@ -195,6 +320,7 @@ impl Terminal {
             screen.approval = false;
             screen.decision_prompt = None;
             screen.text_prompt = false;
+            screen.model_thinking.end();
             screen.status = match &session.status {
                 SessionStatus::Idle => "Ready",
                 SessionStatus::Running => "Task running",
@@ -1058,23 +1184,52 @@ impl Terminal {
         self.at(&mut out, prefix_width as u16, (footer + 1) as u16,
             input_width, &visible, Tone::Assistant)?;
         self.at(&mut out, 0, (footer + 2) as u16, width.saturating_sub(1), &"─".repeat(width.saturating_sub(1)), Tone::Muted)?;
-        let hint = if screen.text_prompt { " Enter submit · Esc or Ctrl+C cancel" }
-            else if screen.decision_prompt.is_some() { " Enter choose · Ctrl+C wait" }
-            else if screen.approval { " Enter confirm · Ctrl+C decline" }
-            else if menu_height > 0 { " ↑↓ choose · Enter select · Tab complete · Esc close" }
-            else if width >= 100 { " Enter send  ·  Ctrl+C exit  ·  ↑↓ history  ·  PgUp/PgDn scroll" }
-            else { " Enter send · Ctrl+C exit · ↑↓ history" };
-        let status_width = (width / 3).min(30);
-        let hint_width = width.saturating_sub(status_width + 3);
-        self.at(&mut out, 1, (footer + 3) as u16, hint_width, hint, Tone::Muted)?;
-        let status = truncate(&screen.status, status_width);
-        if !status.is_empty() {
-            self.at(&mut out, (width - status.chars().count() - 2) as u16,
-                (footer + 3) as u16, status.chars().count(), &status, Tone::Info)?;
-        }
+        self.draw_footer_status(&mut out, &screen, width, height, menu_height)?;
         let cursor_x = (prefix_width + screen.cursor.saturating_sub(first_visible)).min(width - 1) as u16;
         queue!(out, MoveTo(cursor_x, (footer + 1) as u16), Show)?;
         out.flush().context("drawing Echo terminal screen")
+    }
+
+    fn draw_footer_status(&self, out: &mut impl Write, screen: &Screen,
+        width: usize, height: usize, menu_height: usize) -> Result<()> {
+        let thinking = screen.model_thinking.label();
+        let hint = if screen.text_prompt { " Enter submit · Esc or Ctrl+C cancel" }
+            else if screen.decision_prompt.is_some() { " Enter choose · Ctrl+C wait" }
+            else if screen.approval { " Enter confirm · Ctrl+C decline" }
+            else if thinking.is_some() && width >= 110 { " Ctrl+C cancel · type to queue" }
+            else if thinking.is_some() && width >= 70 { " Ctrl+C cancel" }
+            else if thinking.is_some() { "" }
+            else if menu_height > 0 { " ↑↓ choose · Enter select · Tab complete · Esc close" }
+            else if width >= 100 { " Enter send  ·  Ctrl+C exit  ·  ↑↓ history  ·  PgUp/PgDn scroll" }
+            else { " Enter send · Ctrl+C exit · ↑↓ history" };
+        let status_width = if thinking.is_some() {
+            width.saturating_sub(hint.chars().count() + 3)
+        } else {
+            (width / 3).min(30)
+        };
+        let hint_width = width.saturating_sub(status_width + 3);
+        self.at(out, 1, (height - 1) as u16, hint_width, hint, Tone::Muted)?;
+        let status = truncate(thinking.as_deref().unwrap_or(&screen.status), status_width);
+        if !status.is_empty() {
+            self.at(out, (width - status.chars().count() - 2) as u16,
+                (height - 1) as u16, status.chars().count(), &status, Tone::Info)?;
+        }
+        Ok(())
+    }
+
+    fn redraw_footer_status(&self) -> Result<()> {
+        let Some(screen) = &self.screen else { return Ok(()); };
+        let (width, height) = terminal::size().context("reading terminal size")?;
+        let width = usize::from(width);
+        let height = usize::from(height);
+        if width < 5 || height < 8 { return Ok(()); }
+        let screen = screen.borrow();
+        let menu_height = Self::menu_items(&screen).len().min(height.saturating_sub(8).min(8));
+        let mut out = io::stdout();
+        queue!(out, SavePosition, MoveTo(0, (height - 1) as u16), Clear(ClearType::CurrentLine))?;
+        self.draw_footer_status(&mut out, &screen, width, height, menu_height)?;
+        queue!(out, RestorePosition)?;
+        out.flush().context("drawing Echo model status")
     }
 
     fn at(&self, out: &mut impl Write, x: u16, y: u16, width: usize,
@@ -1473,8 +1628,26 @@ impl AgentEventSink for Terminal {
         Ok(())
     }
 
+    fn begin_model_thinking(&mut self) -> Result<()> {
+        if let Some(screen) = &self.screen {
+            screen.borrow_mut().model_thinking.begin();
+            self.redraw_footer_status()?;
+        }
+        Ok(())
+    }
+
+    fn end_model_thinking(&mut self) -> Result<()> {
+        if let Some(screen) = &self.screen {
+            screen.borrow_mut().model_thinking.end();
+            self.redraw_footer_status()?;
+        }
+        Ok(())
+    }
+
     fn poll_busy(&mut self) -> Option<crate::events::BusyInput> {
         let screen = self.screen.as_ref()?;
+        let thinking_changed = screen.borrow_mut().model_thinking.tick();
+        if thinking_changed { let _ = self.redraw_footer_status(); }
         if !event::poll(Duration::ZERO).ok()? { return None; }
         match event::read().ok()? {
             Event::Resize(_, _) => { let _ = self.draw(); None }

@@ -259,6 +259,10 @@ impl Agent<'_> {
             });
             let mut queued = Vec::new();
             self.events.begin_busy()?;
+            if let Err(error) = self.events.begin_model_thinking() {
+                let _ = self.events.end_busy();
+                return Err(error);
+            }
             let model_result = model.complete_streaming(&input, self.cancel, |progress| match progress {
                 ModelProgress::Delta(text) => {
                     self.events.emit(AgentEvent::ModelDelta { text });
@@ -275,7 +279,10 @@ impl Agent<'_> {
                 },
                 ModelProgress::Usage(usage) => self.account_usage(usage),
             });
-            self.events.end_busy()?;
+            let thinking_end = self.events.end_model_thinking();
+            let busy_end = self.events.end_busy();
+            thinking_end?;
+            busy_end?;
             self.events.emit(AgentEvent::ModelReset);
             let turn = model_result?;
             self.store.save(self.session)?;
