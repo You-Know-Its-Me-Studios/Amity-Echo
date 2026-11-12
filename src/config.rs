@@ -116,7 +116,7 @@ pub struct ResourceSettings {
 
 impl Default for ResourceSettings {
     fn default() -> Self {
-        Self { host_timeout_seconds: 1200, max_agent_turns: 8, max_history_messages: 40 }
+        Self { host_timeout_seconds: 1200, max_agent_turns: 32, max_history_messages: 40 }
     }
 }
 

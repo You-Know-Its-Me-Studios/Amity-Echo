@@ -290,6 +290,14 @@ impl HostClient {
         self.one("approve-resource", &[proposal_id], None)
     }
 
+    pub fn policy_approve(&self, change_id: &str) -> Result<Value, HostError> {
+        self.one("policy-approve", &[change_id], None)
+    }
+
+    pub fn policy_activate(&self, change_id: &str) -> Result<Value, HostError> {
+        self.one("policy-activate", &[change_id], None)
+    }
+
     pub fn execute(&self, task_id: &str, step_id: &str, approval_id: Option<&str>) -> Result<HostResponse, HostError> {
         let mut args = vec![task_id, step_id];
         if let Some(id) = approval_id { args.push(id); }
@@ -306,6 +314,22 @@ impl HostClient {
 
     pub fn tool_search(&self, query: &str) -> Result<Value, HostError> {
         self.one("tool-search", &[query], None)
+    }
+
+    /// Forward one coding-agent action to Amity's governed tool gateway.
+    /// Policy denials remain structured host replies for the agent to handle.
+    pub fn agent_tool(&self, task_id: Option<&str>, action: Value) -> Result<Value, HostError> {
+        let input = json!({"task_id": task_id, "action": action}).to_string();
+        let response = self.call("agent-tool", &[], Some(&input))?;
+        if response.records.len() != 1 {
+            return Err(HostError::Protocol("Amity agent-tool must return exactly one JSON record".into()));
+        }
+        let record = response.records.into_iter().next()
+            .expect("agent-tool record count was checked");
+        if !record.get("ok").is_some_and(Value::is_boolean) {
+            return Err(HostError::Protocol("Amity agent-tool reply has no boolean ok field".into()));
+        }
+        Ok(record)
     }
 
     pub fn aip(&self, request: Value) -> Result<Value, HostError> {

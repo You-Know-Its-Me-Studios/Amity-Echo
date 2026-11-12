@@ -18,6 +18,7 @@ use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlt
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 
+use crate::events::{AgentEvent, AgentEventSink};
 use crate::state::{MessageRole, Session, SessionStatus};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,6 +106,7 @@ struct Screen {
     scroll: usize,
     status: String,
     approval: bool,
+    decision_prompt: Option<String>,
     raw: bool,
     history: Vec<String>,
     history_position: Option<usize>,
@@ -146,7 +148,8 @@ impl Terminal {
         self.screen = Some(RefCell::new(Screen {
             cwd: cwd.to_path_buf(), project: "Local workspace".into(), session: "new".into(),
             model: "not connected".into(), lines: Vec::new(), input: String::new(),
-            cursor: 0, scroll: 0, status: "Ready".into(), approval: false, raw: false,
+            cursor: 0, scroll: 0, status: "Ready".into(), approval: false,
+            decision_prompt: None, raw: false,
             history: Vec::new(), history_position: None, saved_draft: String::new(),
             engaged: false, menu_choices: Vec::new(), project_connected: false,
             menu_index: 0, menu_dismissed: false,
@@ -185,10 +188,12 @@ impl Terminal {
             screen.history_position = None;
             screen.saved_draft.clear();
             screen.approval = false;
+            screen.decision_prompt = None;
             screen.status = match &session.status {
                 SessionStatus::Idle => "Ready",
                 SessionStatus::Running => "Task running",
                 SessionStatus::WaitingApproval => "Approval needed",
+                SessionStatus::AwaitingUserDecision => "Decision needed",
                 SessionStatus::Interrupted => "Task interrupted",
                 SessionStatus::Completed => "Task complete",
                 SessionStatus::Failed => "Task failed",
@@ -368,9 +373,8 @@ impl Terminal {
         out.flush().context("drawing Echo session browser")
     }
 
-    pub fn ask_approval(&mut self, description: &str) -> Result<bool> {
+    pub fn ask_approval(&mut self, _description: &str) -> Result<bool> {
         if self.screen.is_some() {
-            self.log(description, Tone::Warning);
             self.screen.as_ref().expect("screen is present").borrow_mut().approval = true;
             loop {
                 match self.read_screen_input(false)? {
@@ -383,7 +387,6 @@ impl Terminal {
                 }
             }
         }
-        self.warning(description);
         loop {
             let prompt = format!("{} ", self.paint("Approve this operation? [y/N]", "1;33"));
             match self.read_with_prompt(&prompt, false)? {
@@ -395,6 +398,51 @@ impl Terminal {
                 Input::Interrupt | Input::Eof => return Ok(false),
             }
         }
+    }
+
+    fn ask_policy_decision(&mut self, description: &str, choices: &[String]) -> Result<Option<String>> {
+        self.warning(description);
+        if choices.is_empty() { return Ok(None); }
+        for (index, choice) in choices.iter().enumerate() {
+            self.info(&format!("{}. {choice}", index + 1));
+        }
+        if let Some(screen) = &self.screen {
+            let mut screen = screen.borrow_mut();
+            screen.approval = true;
+            screen.decision_prompt = Some(format!(" Decision [1-{}] (Enter waits)  ", choices.len()));
+        }
+        let result = (|| -> Result<Option<String>> {
+            loop {
+                let input = if self.screen.is_some() {
+                    self.read_screen_input(false)?
+                } else {
+                    let prompt = format!("{} ", self.paint(
+                        &format!("Decision [1-{}] (Enter waits):", choices.len()), "1;33"));
+                    self.read_with_prompt(&prompt, false)?
+                };
+                match input {
+                    Input::Line(answer) if answer.trim().is_empty() => return Ok(None),
+                    Input::Line(answer) => {
+                        if let Ok(index) = answer.trim().parse::<usize>() {
+                            if let Some(choice) = index.checked_sub(1).and_then(|index| choices.get(index)) {
+                                return Ok(Some(choice.clone()));
+                            }
+                        }
+                        self.info(&format!("Choose a number from 1 to {}, or press Enter to wait.", choices.len()));
+                    }
+                    Input::Interrupt | Input::Eof => return Ok(None),
+                }
+            }
+        })();
+        if let Some(screen) = &self.screen {
+            let mut screen = screen.borrow_mut();
+            screen.approval = false;
+            screen.decision_prompt = None;
+            screen.input.clear();
+            screen.cursor = 0;
+        }
+        let _ = self.draw();
+        result
     }
 
     fn read_screen_input(&mut self, record_input: bool) -> Result<Input> {
@@ -836,7 +884,9 @@ impl Terminal {
         }
 
         self.at(&mut out, 0, footer as u16, width.saturating_sub(1), &"─".repeat(width.saturating_sub(1)), Tone::Muted)?;
-        let prefix = if screen.approval { " Approve operation? [y/N]  " } else { " › " };
+        let prefix = if screen.approval {
+            screen.decision_prompt.as_deref().unwrap_or(" Approve operation? [y/N]  ")
+        } else { " › " };
         let prefix_width = prefix.chars().count().min(width.saturating_sub(1));
         let input_width = width.saturating_sub(prefix_width + 1);
         self.at(&mut out, 0, (footer + 1) as u16, width, prefix, Tone::Brand)?;
@@ -845,7 +895,8 @@ impl Terminal {
         self.at(&mut out, prefix_width as u16, (footer + 1) as u16,
             input_width, &visible, Tone::Assistant)?;
         self.at(&mut out, 0, (footer + 2) as u16, width.saturating_sub(1), &"─".repeat(width.saturating_sub(1)), Tone::Muted)?;
-        let hint = if screen.approval { " Enter confirm · Ctrl+C decline" }
+        let hint = if screen.decision_prompt.is_some() { " Enter choose · Ctrl+C wait" }
+            else if screen.approval { " Enter confirm · Ctrl+C decline" }
             else if menu_height > 0 { " ↑↓ choose · Enter select · Tab complete · Esc close" }
             else if width >= 100 { " Enter send  ·  Ctrl+C exit  ·  ↑↓ history  ·  PgUp/PgDn scroll" }
             else { " Enter send · Ctrl+C exit · ↑↓ history" };
@@ -1145,6 +1196,54 @@ impl Terminal {
     }
 }
 
+impl AgentEventSink for Terminal {
+    fn emit(&mut self, event: AgentEvent) {
+        match event {
+            AgentEvent::Assistant { message } => Terminal::assistant(self, &message),
+            AgentEvent::Info { message } => Terminal::info(self, &message),
+            AgentEvent::Warning { message } => Terminal::warning(self, &message),
+            AgentEvent::Error { message } => Terminal::error(self, &message),
+            AgentEvent::Operation { detail } => Terminal::operation(self, &detail),
+            AgentEvent::ToolRequest { tool, detail } => {
+                Terminal::operation(self, &format!("{tool} · {detail}"));
+            }
+            AgentEvent::ToolResult { name, result, success } => {
+                Terminal::tool_result(self, &name, &result, success);
+            }
+            AgentEvent::Proposal { label, details } => Terminal::proposal(self, &label, &details),
+            AgentEvent::Raw { data } => Terminal::raw(self, &data),
+            AgentEvent::Context { project, session, model } => {
+                Terminal::context(self, &project, &session, &model);
+            }
+            AgentEvent::PolicyDecision { task_id, operation, decision, reason, policy, choices } => {
+                let mut message = format!("Task {task_id} · {decision} · {operation}: {reason}");
+                if let Some(policy) = policy { message.push_str(&format!(" (policy: {policy})")); }
+                if !choices.is_empty() { message.push_str(". User decision required."); }
+                if decision.eq_ignore_ascii_case("allowed") {
+                    Terminal::info(self, &message);
+                } else {
+                    Terminal::warning(self, &message);
+                }
+            }
+            AgentEvent::ApprovalRequested { description } => {
+                Terminal::warning(self, &description);
+            }
+            AgentEvent::TaskState { task_id, state } => {
+                Terminal::info(self, &format!("Task {task_id} · {state}"));
+            }
+            AgentEvent::Completed { summary } => Terminal::info(self, &summary),
+        }
+    }
+
+    fn ask_approval(&mut self, description: &str) -> Result<bool> {
+        Terminal::ask_approval(self, description)
+    }
+
+    fn ask_decision(&mut self, description: &str, choices: &[String]) -> Result<Option<String>> {
+        self.ask_policy_decision(description, choices)
+    }
+}
+
 impl Drop for Terminal {
     fn drop(&mut self) {
         if self.screen.take().is_none() { return; }
@@ -1180,7 +1279,8 @@ fn session_picker_rows<'a>(entries: &'a [SessionPickerEntry], query: &str,
     let mut rows: Vec<_> = entries.iter().filter(|entry| {
         if cwd_only && !entry.cwd_match { return false; }
         let active = matches!(&entry.status, SessionStatus::Idle | SessionStatus::Running
-            | SessionStatus::WaitingApproval | SessionStatus::Interrupted);
+            | SessionStatus::WaitingApproval | SessionStatus::AwaitingUserDecision
+            | SessionStatus::Interrupted);
         if (status_filter == 1 && !active) || (status_filter == 2 && active) { return false; }
         query.is_empty() || entry.title.to_lowercase().contains(query.as_str())
             || entry.project_name.to_lowercase().contains(query.as_str())
@@ -1200,6 +1300,7 @@ fn session_status_label(status: &SessionStatus) -> &'static str {
         SessionStatus::Idle => "ready",
         SessionStatus::Running => "running",
         SessionStatus::WaitingApproval => "approval",
+        SessionStatus::AwaitingUserDecision => "decision",
         SessionStatus::Interrupted => "paused",
         SessionStatus::Completed => "complete",
         SessionStatus::Failed => "failed",

@@ -1,5 +1,6 @@
 mod agent;
 mod config;
+mod events;
 mod host;
 mod model;
 mod state;
@@ -107,7 +108,7 @@ fn run() -> Result<()> {
         Some("status") => {
             let mut session = current_session(&config, &store)?;
             let mut agent = Agent { config: &config, store: &store, session: &mut session,
-                terminal: &mut terminal, cancel: cancel.as_ref(), interactive: false };
+                events: &mut terminal, cancel: cancel.as_ref(), interactive: false };
             agent.status()
         }
         Some("approve") => {
@@ -116,55 +117,63 @@ fn run() -> Result<()> {
             }
             let mut session = current_session(&config, &store)?;
             let mut agent = Agent { config: &config, store: &store, session: &mut session,
-                terminal: &mut terminal, cancel: cancel.as_ref(), interactive: false };
+                events: &mut terminal, cancel: cancel.as_ref(), interactive: false };
             agent.approve()
         }
         Some("cancel") => {
             let mut session = current_session(&config, &store)?;
             let mut agent = Agent { config: &config, store: &store, session: &mut session,
-                terminal: &mut terminal, cancel: cancel.as_ref(), interactive: false };
+                events: &mut terminal, cancel: cancel.as_ref(), interactive: false };
             agent.cancel_task()
+        }
+        Some("decision") => {
+            let choice = args.get(1).context("usage: echocli decision <choice>")?;
+            if args.len() != 2 { bail!("usage: echocli decision <choice>"); }
+            let mut session = current_session(&config, &store)?;
+            let mut agent = Agent { config: &config, store: &store, session: &mut session,
+                events: &mut terminal, cancel: cancel.as_ref(), interactive: false };
+            agent.decide(choice)
         }
         Some("continue") => {
             let mut session = current_session(&config, &store)?;
             let mut agent = Agent { config: &config, store: &store, session: &mut session,
-                terminal: &mut terminal, cancel: cancel.as_ref(), interactive: false };
+                events: &mut terminal, cancel: cancel.as_ref(), interactive: false };
             agent.advance_task()
         }
         Some("interrupt") => {
             let mut session = current_session(&config, &store)?;
             let mut agent = Agent { config: &config, store: &store, session: &mut session,
-                terminal: &mut terminal, cancel: cancel.as_ref(), interactive: false };
+                events: &mut terminal, cancel: cancel.as_ref(), interactive: false };
             agent.interrupt()
         }
         Some("review") => {
             let mut session = current_session(&config, &store)?;
             let mut agent = Agent { config: &config, store: &store, session: &mut session,
-                terminal: &mut terminal, cancel: cancel.as_ref(), interactive: false };
+                events: &mut terminal, cancel: cancel.as_ref(), interactive: false };
             agent.review()
         }
         Some("raw") => {
             let mut session = current_session(&config, &store)?;
             let mut agent = Agent { config: &config, store: &store, session: &mut session,
-                terminal: &mut terminal, cancel: cancel.as_ref(), interactive: false };
+                events: &mut terminal, cancel: cancel.as_ref(), interactive: false };
             agent.raw()
         }
         Some("tools") => {
             let mut session = current_session(&config, &store)?;
             let mut agent = Agent { config: &config, store: &store, session: &mut session,
-                terminal: &mut terminal, cancel: cancel.as_ref(), interactive: false };
+                events: &mut terminal, cancel: cancel.as_ref(), interactive: false };
             agent.capabilities()
         }
         Some("report") => {
             let mut session = current_session(&config, &store)?;
             let mut agent = Agent { config: &config, store: &store, session: &mut session,
-                terminal: &mut terminal, cancel: cancel.as_ref(), interactive: false };
+                events: &mut terminal, cancel: cancel.as_ref(), interactive: false };
             agent.report()
         }
         Some("reconcile") => {
             let mut session = current_session(&config, &store)?;
             let mut agent = Agent { config: &config, store: &store, session: &mut session,
-                terminal: &mut terminal, cancel: cancel.as_ref(), interactive: false };
+                events: &mut terminal, cancel: cancel.as_ref(), interactive: false };
             agent.reconcile()
         }
         Some("task") => {
@@ -175,7 +184,7 @@ fn run() -> Result<()> {
             let safe_instruction = session.messages.last().context("stored message is missing")?.content.clone();
             store.save(&session)?;
             let mut agent = Agent { config: &config, store: &store, session: &mut session,
-                terminal: &mut terminal, cancel: cancel.as_ref(), interactive: false };
+                events: &mut terminal, cancel: cancel.as_ref(), interactive: false };
             agent.start_task(&safe_instruction)
         }
         Some("task-steps") => {
@@ -190,14 +199,14 @@ fn run() -> Result<()> {
             let safe_instruction = session.messages.last().context("stored message is missing")?.content.clone();
             store.save(&session)?;
             let mut agent = Agent { config: &config, store: &store, session: &mut session,
-                terminal: &mut terminal, cancel: cancel.as_ref(), interactive: false };
+                events: &mut terminal, cancel: cancel.as_ref(), interactive: false };
             agent.start_task_steps(&safe_instruction, steps)
         }
         Some(_) => {
             let instruction = args.join(" ");
             let mut session = current_session(&config, &store)?;
             let mut agent = Agent { config: &config, store: &store, session: &mut session,
-                terminal: &mut terminal, cancel: cancel.as_ref(), interactive: false };
+                events: &mut terminal, cancel: cancel.as_ref(), interactive: false };
             agent.instruction(&instruction)
         }
     }
@@ -418,7 +427,7 @@ fn interactive(config: &mut Config, store: &SessionStore, terminal: &mut Termina
                     if let Err(error) = result { terminal.error(&format!("{error:#}")); }
                     continue;
                 }
-                let mut agent = Agent { config, store, session: &mut session, terminal, cancel, interactive: true };
+                let mut agent = Agent { config, store, session: &mut session, events: terminal, cancel, interactive: true };
                 let result = match line {
                     "/status" => agent.status(),
                     "/review" => agent.review(),
@@ -451,10 +460,10 @@ fn interactive(config: &mut Config, store: &SessionStore, terminal: &mut Termina
                             agent.start_task_steps(&safe_instruction, steps)
                         })()
                     }
-                    _ if line.starts_with('/') => { agent.terminal.warning("Unknown command. Type /help."); Ok(()) }
+                    _ if line.starts_with('/') => { agent.events.warning("Unknown command. Type /help."); Ok(()) }
                     _ => agent.instruction(line),
                 };
-                if let Err(error) = result { agent.terminal.error(&format!("{error:#}")); }
+                if let Err(error) = result { agent.events.error(&format!("{error:#}")); }
             }
         }
     }
@@ -690,6 +699,7 @@ echocli update --check           Check for a newer release\n\
 echocli --version                Show the installed Echo version\n\
 echocli review                   Show pending gateway proposal\n\
 echocli approve --yes            Explicitly approve and execute pending proposal\n\
+echocli decision <choice>         Resolve a pending Amity policy decision\n\
 echocli continue | interrupt | cancel | raw  Manage or inspect active task\n\
 echocli tools | report | reconcile Inspect host capabilities and evidence\n\
 echocli project add <amity-host.json>  Register its bound project\n\

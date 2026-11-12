@@ -1,6 +1,6 @@
 //! Conversational use of Amity's configured JSON-over-stdio model backend.
 //! The process receives the same ModelInput fields as Amity task_runtime.
-//! Echo only accepts read-only AIP requests here; changes use task_runtime.
+//! Echo validates each model turn and sends requested tools to the Amity host.
 
 use crate::config::ProjectRegistration;
 use anyhow::{Context, Result, bail};
@@ -29,6 +29,7 @@ struct ModelBinding {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ModelTurn {
     AipRequest { request: String },
+    ToolRequest { tool: String, arguments: Value },
     FinalProposal { proposal: String },
 }
 
@@ -90,6 +91,9 @@ impl ChatModel {
         let turn: ModelTurn = serde_json::from_slice(&output).context("model returned invalid ModelTurn JSON")?;
         match &turn {
             ModelTurn::AipRequest { request } if request.len() > 64 * 1024 => bail!("model AIP request exceeds limit"),
+            ModelTurn::ToolRequest { tool, arguments }
+                if tool.trim().is_empty() || tool.len() > 80 || !arguments.is_object()
+                    || arguments.to_string().len() > 128 * 1024 => bail!("model tool request is invalid or exceeds limit"),
             ModelTurn::FinalProposal { proposal } if proposal.trim().is_empty() || proposal.len() > 32 * 1024 => bail!("model answer exceeds limit or is empty"),
             _ => Ok(turn),
         }

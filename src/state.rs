@@ -1,5 +1,6 @@
 use crate::config::{Config, invalid};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::fs::{self, OpenOptions};
 use std::io::{self, ErrorKind, Write};
 use std::path::{Path, PathBuf};
@@ -23,6 +24,16 @@ pub struct Session {
     pub active_task: Option<String>,
     pub active_step: Option<String>,
     pub pending_approval: Option<String>,
+    #[serde(default)]
+    pub pending_policy_change: Option<String>,
+    #[serde(default)]
+    pub pending_command: Option<Value>,
+    #[serde(default)]
+    pub pending_denial: Option<String>,
+    #[serde(default)]
+    pub pending_instruction: Option<String>,
+    #[serde(default)]
+    pub agent_task: bool,
 }
 
 impl Session {
@@ -57,6 +68,7 @@ pub enum SessionStatus {
     Idle,
     Running,
     WaitingApproval,
+    AwaitingUserDecision,
     Interrupted,
     Completed,
     Failed,
@@ -96,6 +108,9 @@ impl SessionStore {
             created_at_ms: now, updated_at_ms: now,
             status: SessionStatus::Idle, messages: Vec::new(), task_ids: Vec::new(),
             active_task: None, active_step: None, pending_approval: None,
+            pending_policy_change: None, pending_command: None,
+            pending_denial: None,
+            pending_instruction: None, agent_task: false,
         };
         self.save(&session)?;
         Ok(session)
@@ -116,6 +131,9 @@ impl SessionStore {
     pub fn save(&self, session: &Session) -> io::Result<()> {
         validate_id(&session.id)?;
         let mut safe = session.clone();
+        if let Some(instruction) = &mut safe.pending_instruction {
+            *instruction = redact_credentials(instruction);
+        }
         for message in &mut safe.messages {
             message.content = redact_credentials(&message.content);
         }
