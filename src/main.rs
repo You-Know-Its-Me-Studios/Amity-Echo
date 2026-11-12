@@ -236,7 +236,7 @@ fn interactive(config: &mut Config, store: &SessionStore, terminal: &mut Termina
                     (|| -> Result<()> {
                         let cwd = env::current_dir()?;
                         let project = config.select_working_directory(&cwd)?.clone();
-                        config.save()?;
+                        config.save().context("saving Echo workspace selection")?;
                         session = Some(current_session(config, store)?);
                         show_session(config, terminal, session.as_ref());
                         if workspace::initialize(config, &project)? {

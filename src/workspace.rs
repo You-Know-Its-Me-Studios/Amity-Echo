@@ -29,7 +29,7 @@ pub fn initialize(config: &mut Config, project: &ProjectRegistration) -> Result<
     next.active_project_mut().context("initialized workspace is missing")?
         .token_file = Some(token_path);
     next.host_executable = host;
-    next.save()?;
+    next.save().context("saving initialized Amity connection")?;
     *config = next;
     Ok(true)
 }

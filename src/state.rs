@@ -264,10 +264,31 @@ pub(crate) fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> io::Res
         let mut file = OpenOptions::new().write(true).create_new(true).open(&temp)?;
         file.write_all(&data)?;
         file.sync_all()?;
-        replace_file(&temp, path)
+        drop(file);
+        replace_file_with_retry(&temp, path)
     })();
     if write_result.is_err() { let _ = fs::remove_file(&temp); }
     write_result
+}
+
+fn replace_file_with_retry(temp: &Path, target: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        for attempt in 0..5 {
+            match replace_file(temp, target) {
+                Err(error) if attempt < 4
+                    && matches!(error.raw_os_error(), Some(32 | 33 | 1175)) => {
+                    std::thread::sleep(std::time::Duration::from_millis(25 << attempt));
+                }
+                result => return result,
+            }
+        }
+        unreachable!("the final replacement attempt always returns");
+    }
+    #[cfg(not(windows))]
+    {
+        replace_file(temp, target)
+    }
 }
 
 #[cfg(not(windows))]
