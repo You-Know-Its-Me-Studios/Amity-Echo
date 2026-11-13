@@ -37,10 +37,22 @@ class Terminal:
         raise AssertionError(f'Terminal did not show {text!r}:\n{self.display()}')
     def type(self,text):self.process.write(text)
     def stop(self):
-        if self.process.isalive():self.type('/exit\r')
+        if self.process.isalive():
+            self.type('\x1b');time.sleep(.1);self.type('/exit\r')
         end=time.monotonic()+5
         while self.process.isalive() and time.monotonic()<end:time.sleep(.05)
         if self.process.isalive():self.process.terminate(force=True)
+
+def wait_config(home, predicate, timeout=60):
+    end=time.monotonic()+timeout
+    while time.monotonic()<end:
+        try:
+            config=json.loads((home/'config.json').read_text(encoding='utf-8'))
+            if predicate(config):return config
+        except (PermissionError, FileNotFoundError, json.JSONDecodeError):pass
+        time.sleep(.05)
+    raise AssertionError('Echo did not persist the expected command result')
+
 
 def main():
     p=argparse.ArgumentParser();p.add_argument('--cadenza-root',required=True);p.add_argument('--cadenza-config',required=True);p.add_argument('--echo',required=True);p.add_argument('--output',required=True)
@@ -79,14 +91,14 @@ def main():
         assert (home/'config.pre-cadenza.json').read_bytes()==initial_bytes
         assert all('models' not in p and 'selected_model' not in p for p in json.loads((home/'config.json').read_text(encoding='utf-8'))['projects'])
         terminal.type('/model\r');screen=terminal.wait('Select Model and Effort');assert 'Text generation' in screen
-        (output/'picker.txt').write_text(screen,encoding='utf-8');terminal.type('\r');terminal.wait('Model Switched to ')
+        (output/'picker.txt').write_text(screen,encoding='utf-8');terminal.type('\r');wait_config(home,lambda c:(c['cadenza'].get('default_model') or {}).get('root')==models[0]['root']);time.sleep(.2)
         saved=json.loads((home/'config.json').read_text(encoding='utf-8'));assert saved['cadenza']['default_model']['root']==models[0]['root']
         terminal.type('/model\r');terminal.wait('(current)');terminal.type('\x1b');time.sleep(.3)
         assert json.loads((home/'config.json').read_text(encoding='utf-8'))['cadenza']==saved['cadenza']
         terminal.type('The meaning of life is\r');screen=terminal.wait('Response complete',timeout=90)
         (output/'generation-screen.txt').write_text(screen,encoding='utf-8')
         (work/'safe.txt').write_text('public acceptance fixture',encoding='utf-8')
-        terminal.type('/init\r');terminal.wait('Amity is ready',timeout=60)
+        terminal.type('/init\r');wait_config(home,lambda c:any(p['id']==c['active_project'] and Path(p['host_config']).is_file() for p in c['projects']));time.sleep(.2)
         # The installed host's workspace-init baseline places candidate workspaces
         # inside project_root, which agent-tool correctly rejects as overlapping.
         # Give this isolated fixture a non-overlapping candidate base; retain the

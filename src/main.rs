@@ -235,13 +235,17 @@ fn interactive(config: &mut Config, store: &SessionStore, terminal: &mut Termina
         let line = line.trim();
         if line.is_empty() { continue; }
         if line.starts_with('/') {
+            terminal.begin_command(session.as_ref())?;
             let Some(command) = commands::find(line) else {
                 terminal.warning("Unknown command. Type /help to see available commands.");
+                let dismissed = terminal.dismiss_command_output();
+                let cleaned = terminal.end_command(session.as_ref());
+                dismissed?; cleaned?;
                 continue;
             };
             let result = match command.id {
                 Command::Help => terminal.show_help(COMMANDS),
-                Command::Exit => return Ok(()),
+                Command::Exit => Ok(()),
                 Command::Init => {
                     (|| -> Result<()> {
                         let cwd = env::current_dir()?;
@@ -363,7 +367,14 @@ fn interactive(config: &mut Config, store: &SessionStore, terminal: &mut Termina
                     }
                 }
             };
-            if let Err(error) = result { terminal.error(&format!("{error:#}")); }
+            if let Err(error) = &result { terminal.error(&format!("{error:#}")); }
+            let dismissed = if result.is_err() || command.id == Command::Status
+                || (command.id == Command::ReviewChanges && !terminal.command_interacted()) {
+                terminal.dismiss_command_output()
+            } else { Ok(()) };
+            let cleaned = terminal.end_command(session.as_ref());
+            dismissed?; cleaned?;
+            if command.id == Command::Exit { return Ok(()); }
             if matches!(command.id, Command::Init | Command::Project | Command::Sessions | Command::Settings) {
                 steward.restart(config);
             }

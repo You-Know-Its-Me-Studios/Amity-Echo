@@ -44,6 +44,8 @@ Inside Echo, type `/` to open the command menu. The menu filters as you type and
 | `/exit` | Close Echo and return to the terminal. |
 | `/attach` | Add an image or text file to your next message. |
 
+Slash commands use temporary views. Closing a command removes its input and progress messages while preserving the conversation, model, project and session. Read-only results and errors remain visible until Enter or Escape returns to the conversation.
+
 Echo presents approvals and policy decisions when they are needed. You can describe coding work in ordinary language; Echo coordinates the agent and Amity workflow. If the Amity host, model, or permission is missing, Echo explains the next step. Press Ctrl+C at the idle composer to return to the shell. During active work, Ctrl+C cancels the current operation.
 
 The conversation browser shows sessions from the current working directory by default. Tab switches between that directory and all registered projects, F2 changes sort order, F3 filters by session status, Enter opens the selected conversation, and Esc returns without switching. Reopening a conversation restores its stored messages. New sessions record their starting directory; older sessions without that field appear under their registered project root.

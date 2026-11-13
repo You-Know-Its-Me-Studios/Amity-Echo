@@ -118,7 +118,15 @@ pub struct Terminal {
 #[derive(Clone, Copy)]
 enum Tone { Brand, Muted, User, Assistant, Info, Warning, Error, Operation, Tool, Code }
 
-struct ScreenLine { text: String, tone: Tone }
+struct ScreenLine { text: String, tone: Tone, temporary: bool }
+
+struct CommandDisplay {
+    engaged: bool,
+    status: String,
+    scroll: usize,
+    session_status: Option<SessionStatus>,
+    interacted: bool,
+}
 
 #[derive(Clone)]
 struct MenuItem {
@@ -150,6 +158,7 @@ struct Screen {
     menu_dismissed: bool,
     update_version: Option<String>,
     text_prompt: bool,
+    command: Option<CommandDisplay>,
 }
 
 struct ModelThinking {
@@ -292,6 +301,7 @@ impl Terminal {
             menu_index: 0, menu_dismissed: false,
             update_version: None,
             text_prompt: false,
+            command: None,
         }));
         let (sender, receiver) = mpsc::channel();
         self.update_check = Some(receiver);
@@ -313,7 +323,7 @@ impl Terminal {
             screen.stream_start = None;
             screen.stream_buffer.clear();
             screen.scroll = 0;
-            screen.engaged = !session.messages.is_empty();
+            screen.engaged = screen.command.is_some() || !session.messages.is_empty();
             screen.input.clear();
             screen.cursor = 0;
             screen.history_position = None;
@@ -322,37 +332,34 @@ impl Terminal {
             screen.decision_prompt = None;
             screen.text_prompt = false;
             screen.model_thinking.end();
-            screen.status = match &session.status {
-                SessionStatus::Idle => "Ready",
-                SessionStatus::Running => "Task running",
-                SessionStatus::WaitingApproval => "Approval needed",
-                SessionStatus::AwaitingUserDecision => "Decision needed",
-                SessionStatus::Interrupted => "Task interrupted",
-                SessionStatus::Completed => "Task complete",
-                SessionStatus::Failed => "Task failed",
-                SessionStatus::Cancelled => "Task cancelled",
-            }.to_owned();
+            screen.status = session_activity(&session.status).to_owned();
+            if let Some(command) = &mut screen.command {
+                command.engaged = !session.messages.is_empty();
+                command.status = session_activity(&session.status).to_owned();
+                command.scroll = 0;
+                command.session_status = Some(session.status.clone());
+            }
             for message in &session.messages {
                 match &message.role {
-                    MessageRole::User => Self::append_screen_lines(
+                    MessageRole::User => Self::append_conversation_lines(
                         &mut screen, &format!("› {}", message.content), Tone::User),
                     MessageRole::Assistant => {
-                        Self::append_screen_lines(&mut screen, "ECHO", Tone::Brand);
-                        Self::append_screen_lines(&mut screen, &message.content, Tone::Assistant);
-                        Self::append_screen_lines(&mut screen, "", Tone::Muted);
+                        Self::append_conversation_lines(&mut screen, "ECHO", Tone::Brand);
+                        Self::append_conversation_lines(&mut screen, &message.content, Tone::Assistant);
+                        Self::append_conversation_lines(&mut screen, "", Tone::Muted);
                     }
                     MessageRole::Tool => {
-                        Self::append_screen_lines(&mut screen, "TOOL", Tone::Tool);
-                        Self::append_screen_lines(&mut screen, &message.content, Tone::Muted);
-                        Self::append_screen_lines(&mut screen, "", Tone::Muted);
+                        Self::append_conversation_lines(&mut screen, "TOOL", Tone::Tool);
+                        Self::append_conversation_lines(&mut screen, &message.content, Tone::Muted);
+                        Self::append_conversation_lines(&mut screen, "", Tone::Muted);
                     }
                     MessageRole::System => {
-                        Self::append_screen_lines(&mut screen, "SYSTEM", Tone::Warning);
-                        Self::append_screen_lines(&mut screen, crate::inference::user_message(&message.content), Tone::Info);
+                        Self::append_conversation_lines(&mut screen, "SYSTEM", Tone::Warning);
+                        Self::append_conversation_lines(&mut screen, crate::inference::user_message(&message.content), Tone::Info);
                     }
                 }
             }
-            if screen.lines.len() > 4000 {
+            if screen.command.is_none() && screen.lines.len() > 4000 {
                 let excess = screen.lines.len() - 4000;
                 screen.lines.drain(..excess);
             }
@@ -376,6 +383,90 @@ impl Terminal {
             self.paint(&format!("({session}) ›"), "2")
         );
         self.read_with_prompt(&prompt, true)
+    }
+
+    pub fn begin_command(&self, session: Option<&Session>) -> Result<()> {
+        if let Some(screen) = &self.screen {
+            let mut screen = screen.borrow_mut();
+            screen.command = Some(CommandDisplay {
+                engaged: screen.engaged, status: screen.status.clone(), scroll: screen.scroll,
+                session_status: session.map(|s| s.status.clone()), interacted: false,
+            });
+            screen.engaged = true;
+        }
+        self.draw()
+    }
+
+    pub fn command_interacted(&self) -> bool {
+        self.screen.as_ref().is_some_and(|screen| screen.borrow().command.as_ref()
+            .is_some_and(|command| command.interacted))
+    }
+
+    fn mark_command_interaction(&self) {
+        if let Some(screen) = &self.screen {
+            if let Some(command) = &mut screen.borrow_mut().command { command.interacted = true; }
+        }
+    }
+
+    /// Read-only command results remain available until their temporary view closes.
+    pub fn dismiss_command_output(&mut self) -> Result<()> {
+        let Some(screen) = &self.screen else { return Ok(()); };
+        terminal::enable_raw_mode()?;
+        screen.borrow_mut().raw = true;
+        let result = (|| -> Result<()> {
+            loop {
+                self.draw()?;
+                let (width, height) = terminal::size()?;
+                if height > 0 {
+                    let mut out = io::stdout();
+                    queue!(out, Hide, MoveTo(0, height - 1), Clear(ClearType::CurrentLine))?;
+                    self.at(&mut out, 0, height - 1, usize::from(width).saturating_sub(1),
+                        " Enter / Esc back · PgUp/PgDn scroll", Tone::Muted)?;
+                    out.flush()?;
+                }
+                match event::read()? {
+                    Event::Key(key) if key.kind != KeyEventKind::Release => match key.code {
+                        KeyCode::Enter | KeyCode::Esc => return Ok(()),
+                        KeyCode::Char('c' | 'd') if key.modifiers.contains(KeyModifiers::CONTROL) => return Ok(()),
+                        KeyCode::Up | KeyCode::PageUp => {
+                            let mut screen = screen.borrow_mut(); screen.scroll = screen.scroll.saturating_add(8);
+                        },
+                        KeyCode::Down | KeyCode::PageDown => {
+                            let mut screen = screen.borrow_mut(); screen.scroll = screen.scroll.saturating_sub(8);
+                        },
+                        _ => {},
+                    },
+                    _ => {},
+                }
+            }
+        })();
+        let restored = terminal::disable_raw_mode();
+        if restored.is_ok() { screen.borrow_mut().raw = false; }
+        restored?;
+        result
+    }
+
+    pub fn end_command(&self, session: Option<&Session>) -> Result<()> {
+        if let Some(screen) = &self.screen {
+            let mut screen = screen.borrow_mut();
+            if let Some(command) = screen.command.take() {
+                // Streaming indices must follow the retained conversation lines.
+                screen.stream_start = screen.stream_start.map(|start|
+                    screen.lines.iter().take(start).filter(|line| !line.temporary).count());
+                screen.lines.retain(|line| !line.temporary);
+                screen.engaged = command.engaged;
+                screen.scroll = command.scroll;
+                screen.status = if session.map(|s| &s.status) != command.session_status.as_ref() {
+                    session.map(|s| session_activity(&s.status)).unwrap_or("Ready").to_owned()
+                } else { command.status };
+                screen.model_thinking.end();
+                screen.approval = false;
+                screen.text_prompt = false;
+                screen.decision_prompt = None;
+                screen.menu_index = 0;
+            }
+        }
+        self.draw()
     }
 
     /// Choose a real action without requiring the user to remember its ID.
@@ -470,6 +561,7 @@ impl Terminal {
     }
 
     pub fn choose_option(&mut self, title: &str, options: &[MenuChoice]) -> Result<Option<usize>> {
+        self.mark_command_interaction();
         if options.is_empty() { return Ok(None); }
         if self.screen.is_none() {
             self.info(title);
@@ -828,6 +920,7 @@ impl Terminal {
     }
 
     pub fn ask_approval(&mut self, _description: &str) -> Result<bool> {
+        self.mark_command_interaction();
         if self.screen.is_some() {
             self.screen.as_ref().expect("screen is present").borrow_mut().approval = true;
             loop {
@@ -855,6 +948,7 @@ impl Terminal {
     }
 
     fn ask_policy_decision(&mut self, description: &str, choices: &[String]) -> Result<Option<String>> {
+        self.mark_command_interaction();
         self.warning(description);
         if choices.is_empty() { return Ok(None); }
         for (index, choice) in choices.iter().enumerate() {
@@ -1048,7 +1142,9 @@ impl Terminal {
                             screen.menu_dismissed = navigated_history;
                         }
                     }
-                    if let Some(line) = submitted { self.log(&format!("› {line}"), Tone::User); }
+                    if let Some(line) = submitted {
+                        if !line.trim_start().starts_with('/') { self.log(&format!("› {line}"), Tone::User); }
+                    }
                     if let Some(input) = finished { return Ok(input); }
                     self.draw()?;
                 }
@@ -1090,7 +1186,7 @@ impl Terminal {
                 screen.engaged = true;
             }
             Self::append_screen_lines(&mut screen, &safe, tone);
-            if screen.lines.len() > 4000 {
+            if screen.command.is_none() && screen.lines.len() > 4000 {
                 let excess = screen.lines.len() - 4000;
                 screen.lines.drain(..excess);
             }
@@ -1100,6 +1196,14 @@ impl Terminal {
     }
 
     fn append_screen_lines(screen: &mut Screen, message: &str, tone: Tone) {
+        Self::push_screen_lines(screen, message, tone, screen.command.is_some());
+    }
+
+    fn append_conversation_lines(screen: &mut Screen, message: &str, tone: Tone) {
+        Self::push_screen_lines(screen, message, tone, false);
+    }
+
+    fn push_screen_lines(screen: &mut Screen, message: &str, tone: Tone, temporary: bool) {
         let safe = Self::clean(&crate::state::redact_credentials(message));
         let mut in_code = false;
         for line in safe.split('\n') {
@@ -1118,8 +1222,8 @@ impl Terminal {
             } else {
                 tone
             };
-            screen.lines.push(ScreenLine { text: line.to_owned(), tone: line_tone });
-            if screen.lines.len() > 5000 {
+            screen.lines.push(ScreenLine { text: line.to_owned(), tone: line_tone, temporary });
+            if screen.command.is_none() && screen.lines.len() > 5000 {
                 screen.lines.drain(..1000);
             }
         }
@@ -1412,9 +1516,18 @@ impl Terminal {
                 if let Some(start) = screen.stream_start.take() { screen.lines.truncate(start); }
                 screen.stream_buffer.clear();
             }
-            self.log("ECHO", Tone::Brand);
-            self.log(message, Tone::Assistant);
-            self.log("", Tone::Muted);
+            let mut screen = self.screen.as_ref().unwrap().borrow_mut();
+            Self::append_conversation_lines(&mut screen, "ECHO", Tone::Brand);
+            Self::append_conversation_lines(&mut screen, message, Tone::Assistant);
+            Self::append_conversation_lines(&mut screen, "", Tone::Muted);
+            screen.engaged = true;
+            screen.scroll = 0;
+            screen.status = "Ready".into();
+            if let Some(command) = &mut screen.command {
+                command.engaged = true; command.scroll = 0; command.status = "Ready".into();
+            }
+            drop(screen);
+            let _ = self.draw();
             return;
         }
         println!("\n{}", self.paint("Echo", "1;36"));
@@ -1628,9 +1741,10 @@ impl AgentEventSink for Terminal {
                         .map(|index| index + screen.stream_buffer[index..].chars().next()
                             .map(char::len_utf8).unwrap_or(0)).unwrap_or(0);
                     let safe = crate::state::redact_credentials(&screen.stream_buffer[..visible_end]);
-                    Self::append_screen_lines(&mut screen, &safe, Tone::Assistant);
+                    Self::append_conversation_lines(&mut screen, &safe, Tone::Assistant);
                     screen.status = "Echo is responding".into();
                     screen.engaged = true;
+                    if let Some(command) = &mut screen.command { command.engaged = true; command.scroll = 0; }
                     drop(screen);
                     let _ = self.draw();
                 } else {
@@ -1656,7 +1770,10 @@ impl AgentEventSink for Terminal {
                 if let Some(window) = context_window { detail.push_str(&format!(" · {window} context")); }
                 if let Some(cost) = cost_usd { detail.push_str(&format!(" · ${cost:.4}")); }
                 if let Some(screen) = &self.screen {
-                    screen.borrow_mut().status = detail;
+                    let mut screen = screen.borrow_mut();
+                    if let Some(command) = &mut screen.command { command.status = detail.clone(); }
+                    screen.status = detail;
+                    drop(screen);
                     let _ = self.draw();
                 }
             }
@@ -1814,6 +1931,19 @@ impl Tone {
             Self::Tool => Color::Green,
             Self::Code => Color::DarkCyan,
         }
+    }
+}
+
+fn session_activity(status: &SessionStatus) -> &'static str {
+    match status {
+        SessionStatus::Idle => "Ready",
+        SessionStatus::Running => "Task running",
+        SessionStatus::WaitingApproval => "Approval needed",
+        SessionStatus::AwaitingUserDecision => "Decision needed",
+        SessionStatus::Interrupted => "Task interrupted",
+        SessionStatus::Completed => "Task complete",
+        SessionStatus::Failed => "Task failed",
+        SessionStatus::Cancelled => "Task cancelled",
     }
 }
 
