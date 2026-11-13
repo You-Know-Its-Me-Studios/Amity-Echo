@@ -13,10 +13,11 @@ use anyhow::{Context, Result};
 use crossterm::{execute, queue};
 use crossterm::cursor::{Hide, MoveTo, RestorePosition, SavePosition, Show};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use crossterm::style::{Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor};
+use crossterm::style::{Attribute, Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor};
 use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::events::{AgentEvent, AgentEventSink};
 use crate::state::{MessageRole, Session, SessionStatus};
@@ -395,25 +396,65 @@ impl Terminal {
         if cancelled {anyhow::bail!("Cadenza connection cancelled; settings unchanged");} result
     }
 
-    pub fn choose_model(&mut self,models:&[crate::inference::ModelSelection],initial:usize,current:Option<&str>)->Result<Option<usize>> {
+    pub fn choose_model(&mut self, models: &[crate::inference::ModelChoice], initial: usize,
+        current: Option<&crate::inference::ModelSelection>) -> Result<Option<crate::inference::ModelSelection>> {
         if self.screen.is_none(){anyhow::bail!("Open Echo's interactive terminal to choose a Cadenza model");}
         if models.is_empty(){return Ok(None);}
+        let choices: Vec<_> = models.iter().map(|choice| MenuChoice {
+            command: format!("{}{}", choice.model.label(),
+                if current.is_some_and(|m| m.root == choice.model.root) { " (current)" } else { "" }),
+            description: choice.model.description(),
+        }).collect();
         terminal::enable_raw_mode()?;
         self.screen.as_ref().unwrap().borrow_mut().raw=true;
-        let result=(||->Result<Option<usize>> {
-            let mut selected=initial.min(models.len()-1);let mut detail_scroll=0usize;
+        let result=(||->Result<Option<crate::inference::ModelSelection>> {
+            let mut selected=initial.min(models.len()-1);
+            let mut effort: Option<(Vec<MenuChoice>, usize)> = None;
             loop {
-                self.draw_model_picker(models,selected,current,detail_scroll)?;
+                let title = if effort.is_some() {
+                    format!("Select Reasoning Level for {}", models[selected].model.label())
+                } else { "Select Model and Effort".to_owned() };
+                let (rows, index) = match &effort {
+                    Some((options, index)) => (options.as_slice(), *index),
+                    None => (choices.as_slice(), selected),
+                };
+                let page = self.draw_model_picker(&title, rows, index)?;
+                let count = rows.len();
                 match event::read()? {
                     Event::Resize(_,_)=>{},
                     Event::Key(key) if key.kind!=KeyEventKind::Release=>match key.code {
-                        KeyCode::Esc=>return Ok(None),
+                        KeyCode::Esc=>{if effort.is_some() {effort=None;} else {return Ok(None);}},
                         KeyCode::Char('c'|'d') if key.modifiers.contains(KeyModifiers::CONTROL)=>return Ok(None),
-                        KeyCode::Enter if terminal::size().is_ok_and(|(w,h)|w>=30 && h>=12)=>return Ok(Some(selected)),
-                        KeyCode::Up=>{selected=selected.saturating_sub(1);detail_scroll=0;},
-                        KeyCode::Down=>{selected=(selected+1).min(models.len()-1);detail_scroll=0;},
-                        KeyCode::PageUp=>detail_scroll=detail_scroll.saturating_sub(5),
-                        KeyCode::PageDown=>detail_scroll=detail_scroll.saturating_add(5),
+                        KeyCode::Enter if page > 0 => {
+                            let model = &models[selected];
+                            if let Some((_, index)) = &effort {
+                                return Ok(Some(model.reasoning[*index].selection.clone()));
+                            }
+                            if !model.model.ready() || model.reasoning.is_empty() {
+                                return Ok(Some(model.model.clone()));
+                            }
+                            let initial = model.reasoning.iter().position(|r| current == Some(&r.selection))
+                                .or_else(|| model.reasoning.iter().position(|r| r.is_default)).unwrap_or(0);
+                            let options = model.reasoning.iter().map(|r| MenuChoice {
+                                command: format!("{}{}", r.label, if current == Some(&r.selection) {
+                                    " (current)"
+                                } else if r.is_default { " (default)" } else { "" }),
+                                description: r.description.clone(),
+                            }).collect();
+                            effort = Some((options, initial));
+                        },
+                        KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown
+                        | KeyCode::Home | KeyCode::End => {
+                            let index = match &mut effort { Some((_, i)) => i, None => &mut selected };
+                            *index = match key.code {
+                                KeyCode::Up => index.saturating_sub(1),
+                                KeyCode::Down => (*index + 1).min(count - 1),
+                                KeyCode::PageUp => index.saturating_sub(page.max(1)),
+                                KeyCode::PageDown => index.saturating_add(page.max(1)).min(count - 1),
+                                KeyCode::Home => 0,
+                                _ => count - 1,
+                            };
+                        },
                         _=>{},
                     },_=>{},
                 }
@@ -423,20 +464,9 @@ impl Terminal {
         if restore.is_ok(){self.screen.as_ref().unwrap().borrow_mut().raw=false;}
         restore?; self.draw()?;result
     }
-    fn draw_model_picker(&self,models:&[crate::inference::ModelSelection],selected:usize,current:Option<&str>,scroll:usize)->Result<()> {
-        let (width,height)=terminal::size()?;let w=usize::from(width);let h=usize::from(height);let mut out=io::stdout();
-        queue!(out,MoveTo(0,0),Clear(ClearType::All))?;
-        self.at(&mut out,0,0,w," AMITY ECHO / Cadenza models",Tone::Brand)?;
-        if w<30 || h<12 {if h>1{self.at(&mut out,0,1,w," Enlarge the terminal to choose a model",Tone::Warning)?;}out.flush()?;return Ok(());}
-        let rows=((h-7)/2).max(1);let first=selected.saturating_sub(rows-1).min(models.len().saturating_sub(rows));
-        for (offset,m) in models.iter().enumerate().skip(first).take(rows) {
-            let label=format!("{} {}{} · {}",if offset==selected{"›"}else{" "},m.label(),if current==Some(m.root.as_str()){" [current]"}else{""},if m.ready(){"Ready"}else{"Not ready"});
-            self.at(&mut out,1,(2+offset-first)as u16,w-2,&label,if offset==selected{Tone::Brand}else{Tone::Info})?;
-        }
-        let start=3+rows;let detail=wrap(&Self::clean(&models[selected].details()),w-2);let available=h.saturating_sub(start+2);
-        let first_detail=scroll.min(detail.len().saturating_sub(available));
-        for (i,line) in detail.iter().skip(first_detail).take(available).enumerate(){self.at(&mut out,1,(start+i)as u16,w-2,line,Tone::Info)?;}
-        self.at(&mut out,1,height-1,w-2,"↑↓ choose · Enter select · Esc cancel · PgUp/PgDn details",Tone::Muted)?;out.flush()?;Ok(())
+    fn draw_model_picker(&self, title: &str, choices: &[MenuChoice], selected: usize) -> Result<usize> {
+        let (width, height) = terminal::size()?;
+        Ok(render_model_picker(&mut io::stdout(), width, height, title, choices, selected)?)
     }
 
     pub fn choose_option(&mut self, title: &str, options: &[MenuChoice]) -> Result<Option<usize>> {
@@ -1783,6 +1813,97 @@ impl Tone {
             Self::Code => Color::DarkCyan,
         }
     }
+}
+
+/// Clip by terminal cells, keeping service-supplied text on a single row.
+fn picker_clip(text: &str, width: usize) -> String {
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ")
+        .chars().filter(|c| !c.is_control()).collect::<String>();
+    if text.width() <= width { return text; }
+    if width == 0 { return String::new(); }
+    let mut result = String::new();
+    let mut used = 0;
+    for c in text.chars() {
+        let cells = c.width().unwrap_or(0);
+        if used + cells > width - 1 { break; }
+        used += cells;
+        result.push(c);
+    }
+    result.push('…');
+    result
+}
+
+fn picker_name(text: &str, width: usize) -> String {
+    // Keep the current/default marker visible even for a long model name.
+    for suffix in [" (current)", " (default)"] {
+        if let Some(name) = text.strip_suffix(suffix) {
+            if width > suffix.len() {
+                return picker_clip(name, width - suffix.len()) + suffix;
+            }
+        }
+    }
+    picker_clip(text, width)
+}
+
+fn render_model_picker(out: &mut impl Write, width: u16, height: u16, title: &str,
+    choices: &[MenuChoice], selected: usize) -> io::Result<usize> {
+    let w = usize::from(width);
+    let h = usize::from(height);
+    queue!(out, ResetColor, MoveTo(0, 0), Clear(ClearType::All), Hide)?;
+    if w == 0 || h == 0 { out.flush()?; return Ok(0); }
+    let top = if h >= 9 { 1 } else { 0 };
+    queue!(out, MoveTo(1.min(width - 1), top), SetForegroundColor(Color::White),
+        Print(picker_clip(title, w.saturating_sub(2))), ResetColor)?;
+    if w < 16 || h < 5 {
+        if h > 1 {
+            queue!(out, MoveTo(0, height - 1), Print(picker_clip("Enlarge terminal", w.saturating_sub(1))))?;
+        }
+        out.flush()?; return Ok(0);
+    }
+    let start = if h >= 9 { 4 } else { 2 };
+    let stacked = w < 44;
+    let row_height = if stacked { 2 } else { 1 };
+    let rows = (h.saturating_sub(start + 2) / row_height).max(1);
+    let first = selected.saturating_sub(rows - 1).min(choices.len().saturating_sub(rows));
+    let digits = choices.len().to_string().len();
+    let prefix_width = digits + 3;
+    let left_width = choices.iter().map(|c| picker_clip(&c.command, 120).width() + prefix_width)
+        .max().unwrap_or(0).min(42).min(w * 45 / 100);
+    for (index, choice) in choices.iter().enumerate().skip(first).take(rows) {
+        let y = start + (index - first) * row_height;
+        let active = index == selected;
+        let foreground = if active { Color::Grey } else { Color::White };
+        let emphasis = if active { Attribute::Reverse } else { Attribute::NoReverse };
+        // Reverse video keeps selection visible even when NO_COLOR is set.
+        queue!(out, MoveTo(0, y as u16), ResetColor, SetForegroundColor(foreground),
+            SetAttribute(emphasis), Print(" ".repeat(w)), MoveTo(0, y as u16))?;
+        let prefix = format!("{}{:>digits$}. ", if active { "›" } else { " " }, index + 1);
+        let name_width = if stacked { w } else { left_width };
+        let name = picker_name(&choice.command, name_width.saturating_sub(prefix_width));
+        queue!(out, Print(prefix), Print(name))?;
+        if stacked {
+            queue!(out, MoveTo(0, (y + 1) as u16),
+                SetForegroundColor(if active { Color::Grey } else { Color::DarkGrey }),
+                SetAttribute(emphasis),
+                Print(" ".repeat(w)), MoveTo(2, (y + 1) as u16),
+                Print(picker_clip(&choice.description, w - 2)))?;
+        } else {
+            queue!(out, MoveTo((left_width + 2) as u16, y as u16),
+                SetForegroundColor(if active { Color::Grey } else { Color::DarkGrey }),
+                SetAttribute(emphasis),
+                Print(picker_clip(&choice.description, w.saturating_sub(left_width + 3))))?;
+        }
+        queue!(out, SetAttribute(Attribute::NoReverse), ResetColor)?;
+    }
+    let visible = rows.min(choices.len());
+    let footer_y = (start + visible * row_height + 1).min(h - 1);
+    let footer = if choices.len() > rows {
+        format!("enter select · esc back · ↑↓ / PgUp/PgDn · {}–{} of {}", first + 1, first + visible, choices.len())
+    } else { "enter select · esc back".to_owned() };
+    queue!(out, MoveTo(1, footer_y as u16), SetForegroundColor(Color::DarkGrey),
+        Print(picker_clip(&footer, w - 2)), ResetColor)?;
+    out.flush()?;
+    Ok(rows)
 }
 
 fn truncate(text: &str, width: usize) -> String {

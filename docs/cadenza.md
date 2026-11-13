@@ -43,7 +43,9 @@ Interactive startup checks the configured server, readiness and selected identit
 
 ## Model picker and sessions
 
-`/model` uses Echo's native full-screen terminal UI. Discovery is dynamic and has no Lyra-only code path. It highlights the active session selection (or global default), shows the exact reported identity/root, optional name/family/context/precision, capability states and readiness, and supports arrows, Enter, Escape and Page Up/Down for details. Missing metadata is omitted. Selection is revalidated before both global config and session are updated.
+`/model` uses a compact monochrome two-column list in Echo's full-screen terminal. Discovery remains dynamic. Names and short descriptions replace raw identity, root and capability dumps. The active session selection (or global default) is marked `(current)`; the keyboard cursor highlights the entire row. Arrows, Page Up/Down, Home and End navigate the list, Enter selects, and Escape cancels. Descriptions stack under names on narrow terminals, and text is clipped by display-cell width. Selection is revalidated before both global config and session are updated.
+
+The picker also renders a second reasoning-level stage when an inference adapter provides executable reasoning choices. Escape from that stage returns to the model list without saving. Cadenza/1 currently exposes neither selectable reasoning levels nor a generation effort parameter, so its adapter supplies no effort choices and selection completes in one stage. No reasoning levels, wire parameters or model capabilities are inferred or invented.
 
 New sessions inherit the global model. Existing sessions preserve their current Cadenza identity; choosing another model records a change at the current message index. Historical pre-Cadenza model names remain readable and are recorded in model history when a user explicitly selects Cadenza for future turns. New assistant messages record the actual selected root. Old messages are not rewritten to claim they came from a new model.
 

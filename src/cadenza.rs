@@ -49,18 +49,22 @@ impl ModelSelection {
         })
     }
     pub fn label(&self) -> String {
-        format!(
-            "{} {}",
-            self.metadata
-                .get("name")
-                .and_then(Value::as_str)
-                .or_else(|| self.identity.get("id").and_then(Value::as_str))
-                .unwrap_or("Unnamed model"),
-            self.identity
-                .get("version")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-        )
+        let name = self.metadata.get("name").and_then(Value::as_str)
+            .or_else(|| self.identity.get("name").and_then(Value::as_str))
+            .filter(|name| !name.trim().is_empty()).map(str::to_owned)
+            .unwrap_or_else(|| {
+                // Package IDs are routing identities. Show their final name
+                // component when the package has no display name.
+                let id = self.identity.get("id").and_then(Value::as_str).unwrap_or("Model");
+                id.rsplit('.').next().unwrap_or(id).split(['_', '-'])
+                    .filter(|word| !word.is_empty()).map(|word| {
+                        let mut chars = word.chars();
+                        chars.next().map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
+                            .unwrap_or_default()
+                    }).collect::<Vec<_>>().join(" ")
+            });
+        let version = self.identity.get("version").and_then(Value::as_str).unwrap_or("").trim();
+        if version.is_empty() { name } else { format!("{name} {version}") }
     }
     pub fn ready(&self) -> bool {
         self.metadata.get("ready").and_then(Value::as_bool) == Some(true)
@@ -79,29 +83,19 @@ impl ModelSelection {
                 })
             })
     }
-    pub fn details(&self) -> String {
-        let mut lines = vec![
-            format!(
-                "{} · {}",
-                self.label(),
-                if self.ready() { "Ready" } else { "Not ready" }
-            ),
-            format!("Identity: {}", self.identity),
-            format!("Root: {}", self.root),
-        ];
-        if let Some(family) = self.metadata.get("family") {
-            lines.push(format!("Family: {family}"));
+    pub fn description(&self) -> String {
+        let mut parts = Vec::new();
+        if !self.ready() { parts.push("Not ready".to_owned()); }
+        if let Some(description) = self.metadata.get("description").and_then(Value::as_str)
+            .filter(|text| !text.trim().is_empty()) {
+            parts.push(description.to_owned());
+        } else {
+            parts.push(if self.structured() { "Supports coding tools" } else { "Text generation" }.to_owned());
         }
         if let Some(context) = self.context_window() {
-            lines.push(format!("Context: {context} tokens"));
+            parts.push(format!("{context} token context"));
         }
-        if let Some(precision) = self.metadata.get("precision") {
-            lines.push(format!("Precision: {precision}"));
-        }
-        if let Some(capabilities) = self.metadata.get("capabilities") {
-            lines.push(format!("Capabilities: {capabilities}"));
-        }
-        lines.join("\n")
+        parts.join(" · ")
     }
 }
 
@@ -583,7 +577,7 @@ mod tests {
         let models = c.discover().unwrap();
         assert_eq!(models.len(), 2);
         assert_eq!(models[1].root, "b".repeat(64));
-        assert!(!models[0].details().contains("Family:"));
+        assert_eq!(models[0].description(), "Text generation · 128 token context");
         c.health().unwrap();
         server.join().unwrap();
     }

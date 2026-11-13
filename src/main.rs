@@ -500,13 +500,12 @@ fn choose_model(config: &mut Config, store: &SessionStore, terminal: &mut Termin
     let settings=config.cadenza.clone();
     let models=terminal.wait_for_work(move || {
         let mut client=inference::Connection::connect(&settings)?;
-        let models=client.discover()?; client.health()?; Ok(models)
+        let models=client.model_choices()?; client.health()?; Ok(models)
     })?;
     if models.is_empty() { bail!("Cadenza returned no models; the existing selection was preserved"); }
     let current=session.cadenza_model.as_ref().or(config.cadenza.default_model.as_ref());
-    let selected=current.and_then(|m|models.iter().position(|candidate|candidate.root==m.root)).unwrap_or(0);
-    let Some(index)=terminal.choose_model(&models,selected,current.map(|m|m.root.as_str()))? else {return Ok(());};
-    let candidate=models[index].clone();
+    let selected=current.and_then(|m|models.iter().position(|candidate|candidate.model.root==m.root)).unwrap_or(0);
+    let Some(candidate)=terminal.choose_model(&models,selected,current)? else {return Ok(());};
     if !candidate.ready() {bail!("This Cadenza model is not ready. The existing selection was preserved");}
     let settings=config.cadenza.clone();let requested=candidate.clone();
     let candidate=terminal.wait_for_work(move || {

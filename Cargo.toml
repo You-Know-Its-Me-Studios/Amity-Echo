@@ -1,6 +1,6 @@
 [package]
 name = "amity-echo"
-version = "0.3.8"
+version = "0.3.9"
 edition = "2024"
 description = "Amity Echo, the first-party terminal coding agent for Amity"
 
@@ -22,6 +22,7 @@ self-replace = "1.5.1"
 sha2 = "0.10"
 tempfile = "3.0"
 ureq = "3.5.1"
+unicode-width = "0.2.3"
 tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 
 [target."cfg(windows)".dependencies]

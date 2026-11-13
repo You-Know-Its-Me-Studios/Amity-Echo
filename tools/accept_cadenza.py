@@ -78,10 +78,10 @@ def main():
         terminal=Terminal(executable,work,env);terminal.wait('Cadenza connected')
         assert (home/'config.pre-cadenza.json').read_bytes()==initial_bytes
         assert all('models' not in p and 'selected_model' not in p for p in json.loads((home/'config.json').read_text(encoding='utf-8'))['projects'])
-        terminal.type('/model\r');screen=terminal.wait('Cadenza models');assert models[0]['identity']['id'] in screen
+        terminal.type('/model\r');screen=terminal.wait('Select Model and Effort');assert 'Text generation' in screen
         (output/'picker.txt').write_text(screen,encoding='utf-8');terminal.type('\r');terminal.wait('Saved as the global default')
         saved=json.loads((home/'config.json').read_text(encoding='utf-8'));assert saved['cadenza']['default_model']['root']==models[0]['root']
-        terminal.type('/model\r');terminal.wait('[current]');terminal.type('\x1b');time.sleep(.3)
+        terminal.type('/model\r');terminal.wait('(current)');terminal.type('\x1b');time.sleep(.3)
         assert json.loads((home/'config.json').read_text(encoding='utf-8'))['cadenza']==saved['cadenza']
         terminal.type('The meaning of life is\r');screen=terminal.wait('Response complete',timeout=90)
         (output/'generation-screen.txt').write_text(screen,encoding='utf-8')
@@ -111,7 +111,7 @@ def main():
         (output/'cross-directory.json').write_text(json.dumps(events,indent=2),encoding='utf-8')
         for session_path in (home/'sessions').glob('*.json'):
             session=json.loads(session_path.read_text(encoding='utf-8'));assert session['cadenza_model']['root']==models[0]['root']
-        terminal=Terminal(executable,other,env);terminal.wait('Cadenza ready');terminal.type('/model\r');screen=terminal.wait('[current]');(output/'restart-picker.txt').write_text(screen,encoding='utf-8');terminal.type('\x1b');time.sleep(.2);terminal.stop();terminal=None
+        terminal=Terminal(executable,other,env);terminal.wait('Cadenza ready');terminal.type('/model\r');screen=terminal.wait('(current)');(output/'restart-picker.txt').write_text(screen,encoding='utf-8');terminal.type('\x1b');time.sleep(.2);terminal.stop();terminal=None
         desktop=Path.home()/'Desktop'
         no_credential_env=dict(env);no_credential_env.pop(configuration['api_token_env'],None)
         terminal=Terminal(executable,desktop,no_credential_env);terminal.wait('Cadenza credential unavailable');terminal.stop();terminal=None
