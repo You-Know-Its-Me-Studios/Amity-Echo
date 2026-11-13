@@ -1,12 +1,47 @@
 //! Echo's inference boundary. The current deployment uses native Cadenza/1.
 //! A future Amity relay belongs behind this interface, not in the terminal,
 //! session store, or agent workflow.
-use crate::{cadenza, config::CadenzaSettings};
+use crate::{cadenza, config::{CadenzaSettings, Config}, state::{Session, SessionStore}};
 use anyhow::Result;
 use serde_json::Value;
 use std::sync::atomic::AtomicBool;
 
 pub use cadenza::{Completion, ModelSelection};
+pub use cadenza::resolve_selection;
+
+/// One global preference drives every conversation. Session selections retain
+/// deployment provenance, and are a fallback only for older, session-only data.
+pub fn preferred_model<'a>(config: &'a Config, session: &'a Session) -> Option<&'a ModelSelection> {
+    config.cadenza.default_model.as_ref().or(session.cadenza_model.as_ref())
+}
+
+pub fn persist_selection(config: &mut Config, store: &SessionStore,
+    session: &mut Session, model: ModelSelection) -> Result<()> {
+    let global_changed = config.cadenza.default_model.as_ref() != Some(&model);
+    let mut next_session = session.clone();
+    let session_changed = next_session.select_cadenza_model(model.clone());
+    let mut next = config.clone();
+    next.cadenza.default_model = Some(model);
+    if global_changed { next.save()?; }
+    if session_changed && let Err(error) = store.save(&next_session) {
+        if global_changed { config.save()?; }
+        return Err(error.into());
+    }
+    *config = next;
+    *session = next_session;
+    Ok(())
+}
+
+pub fn sync_session(config: &Config, store: &SessionStore, session: &mut Session) -> Result<()> {
+    if let Some(model) = &config.cadenza.default_model {
+        let mut next = session.clone();
+        if next.select_cadenza_model(model.clone()) {
+            store.save(&next)?;
+            *session = next;
+        }
+    }
+    Ok(())
+}
 
 pub fn available_models_message(count: usize) -> String {
     format!("{count} model{} available. Use /model to select.", if count == 1 { "" } else { "s" })
@@ -25,6 +60,14 @@ pub fn user_message(diagnostic: &str) -> &str {
         "Model request cancelled."
     } else if lower.contains("no cadenza model selected") {
         "No model selected. Use /model to select."
+    } else if lower.contains("selection is ambiguous") {
+        "Multiple deployments match your previous model. Use /model to select one."
+    } else if lower.contains("identity changed") {
+        "The model's identity could not be verified. Check the model service before trying again."
+    } else if lower.contains("deployment changed") {
+        "The selected model was updated. Send your request again to use its current deployment."
+    } else if lower.contains("logical identity is no longer served") {
+        "Your selected model is no longer available. Use /model to select another."
     } else if lower.contains("model is unavailable") || lower.contains("model is not ready") || lower.contains("worker is not ready") {
         "Selected model is unavailable. Use /model to choose another."
     } else if lower.contains("cadenza unavailable") || lower.contains("resolving cadenza host") {

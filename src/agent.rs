@@ -11,7 +11,7 @@ use std::thread;
 use std::time::Duration;
 
 pub struct Agent<'a> {
-    pub config: &'a Config,
+    pub config: &'a mut Config,
     pub store: &'a SessionStore,
     pub session: &'a mut Session,
     pub events: &'a mut dyn AgentEventSink,
@@ -20,6 +20,35 @@ pub struct Agent<'a> {
 }
 
 impl Agent<'_> {
+    fn open_model(&mut self) -> Result<ChatModel> {
+        let config = self.config.clone();
+        let selected = crate::inference::preferred_model(&config, self.session).cloned();
+        let timeout = Duration::from_secs(config.cadenza.request_timeout_seconds);
+        self.events.begin_busy()?;
+        let mut queued = Vec::new();
+        let result = thread::scope(|scope| {
+            let handle = scope.spawn(move || ChatModel::open(&config, selected.as_ref(), timeout));
+            while !handle.is_finished() {
+                match self.events.poll_busy() {
+                    Some(BusyInput::Cancel) => self.cancel.store(true, Ordering::Relaxed),
+                    Some(BusyInput::Message(message)) => queued.push(message),
+                    None => {},
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+            handle.join().map_err(|_| anyhow::anyhow!("Model connection worker failed"))?
+        });
+        self.events.end_busy()?;
+        for message in queued { self.session.append_message(MessageRole::User, message); }
+        self.store.save(self.session)?;
+        if self.cancel.load(Ordering::Relaxed) { bail!("Model connection cancelled"); }
+        let model = result?;
+        crate::inference::persist_selection(self.config, self.store, self.session, model.selected.clone())?;
+        let project = self.project()?;
+        self.events.context(&project.name, &self.session.id, &model.version);
+        Ok(model)
+    }
+
     fn account_usage(&mut self, usage: ModelUsage) {
         self.session.usage_input_tokens = self.session.usage_input_tokens
             .saturating_add(usage.input_tokens.unwrap_or(0));
@@ -142,10 +171,10 @@ impl Agent<'_> {
     }
 
     fn chat(&mut self, instruction: &str) -> Result<()> {
-        if self.session.model.is_some() && self.session.cadenza_model.is_none() {
+        if self.session.model.is_some() && crate::inference::preferred_model(self.config, self.session).is_none() {
             bail!("Choose a model with /model to continue this conversation. Your history will be preserved.");
         }
-        let model = ChatModel::open(self.config, self.session.cadenza_model.as_ref(), Duration::from_secs(self.config.cadenza.request_timeout_seconds))?;
+        let model = self.open_model()?;
         if !model.supports_structured() {return self.chat_text(&model,instruction);}
         let host = self.host()?;
         let project = self.project()?;
@@ -855,7 +884,7 @@ impl Agent<'_> {
         } else if tool == "skill_load" {
             json!({"ok":true,"result":crate::skills::load(field(&arguments,"name")?)?})
         } else if tool == "subagents" {
-            let model = ChatModel::open(self.config, self.session.cadenza_model.as_ref(), Duration::from_secs(self.config.cadenza.request_timeout_seconds))?;
+            let model = self.open_model()?;
             let tasks = action.get("tasks").cloned().context("subagents requires tasks")?;
             json!({"ok":true,"result":self.call_subagents_busy(&model, host, tasks, user_updates)?})
         } else if matches!(tool, "run_command" | "editor_query" | "run_verification" | "refresh_evidence"
@@ -1061,7 +1090,7 @@ impl Agent<'_> {
 
     fn explain_task_denial(&mut self, host: &HostClient, task_id: &str,
         denial: &Value) -> Result<()> {
-        let model = ChatModel::open(self.config, self.session.cadenza_model.as_ref(), Duration::from_secs(self.config.cadenza.request_timeout_seconds))?;
+        let model = self.open_model()?;
         let scoped = host.model_scope()?;
         let manifest = scoped.client().context_manifest(&format!("echo:{}.denial", self.session.id))?;
         let manifest_value = manifest.pointer("/result/manifest")
@@ -1204,7 +1233,7 @@ impl Agent<'_> {
             return self.resolve_pending_denial();
         }
         let task_id = self.session.active_task.clone().context("this session has no active task")?;
-        let host = self.host()?;
+        let mut host = self.host()?;
         loop {
             let before = host.task_status(&task_id)?;
             let state = field(&before, "state")?;
@@ -1230,6 +1259,8 @@ impl Agent<'_> {
             }
             self.session.set_status(SessionStatus::Running);
             self.store.save(self.session)?;
+            self.open_model()?;
+            host = self.host()?;
             self.events.operation(&format!("Amity task {task_id} · model and AIP work in progress…"));
             match host.run_task(&task_id, self.cancel) {
                 Ok(_) => {
@@ -1366,8 +1397,8 @@ impl Agent<'_> {
 
     pub fn review(&mut self) -> Result<()> {
         if let Some(request) = self.session.pending_capability.clone() {
+            let model = self.open_model()?;
             let host = self.host()?;
-            let model = ChatModel::open(self.config, self.session.cadenza_model.as_ref(), Duration::from_secs(self.config.cadenza.request_timeout_seconds))?;
             let scoped = host.model_scope()?;
             let model_host = scoped.client();
             let context = json!({

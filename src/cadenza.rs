@@ -48,21 +48,15 @@ impl ModelSelection {
             metadata: value,
         })
     }
+    pub fn logical_id(&self) -> &str {
+        self.identity.get("id").and_then(Value::as_str).unwrap_or("")
+    }
     pub fn label(&self) -> String {
         let name = self.metadata.get("name").and_then(Value::as_str)
-            .or_else(|| self.identity.get("name").and_then(Value::as_str))
-            .filter(|name| !name.trim().is_empty()).map(str::to_owned)
-            .unwrap_or_else(|| {
-                // Package IDs are routing identities. Show their final name
-                // component when the package has no display name.
-                let id = self.identity.get("id").and_then(Value::as_str).unwrap_or("Model");
-                id.rsplit('.').next().unwrap_or(id).split(['_', '-'])
-                    .filter(|word| !word.is_empty()).map(|word| {
-                        let mut chars = word.chars();
-                        chars.next().map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
-                            .unwrap_or_default()
-                    }).collect::<Vec<_>>().join(" ")
-            });
+            .filter(|name| !name.trim().is_empty())
+            .or_else(|| self.identity.get("name").and_then(Value::as_str)
+                .filter(|name| !name.trim().is_empty())).map(str::to_owned)
+            .unwrap_or_else(|| self.logical_id().to_owned());
         let version = self.identity.get("version").and_then(Value::as_str).unwrap_or("").trim();
         if version.is_empty() { name } else { format!("{name} {version}") }
     }
@@ -84,19 +78,49 @@ impl ModelSelection {
             })
     }
     pub fn description(&self) -> String {
-        let mut parts = Vec::new();
-        if !self.ready() { parts.push("Not ready".to_owned()); }
+        let mut parts = vec![if self.ready() { "Ready" } else { "Not ready" }.to_owned()];
         if let Some(description) = self.metadata.get("description").and_then(Value::as_str)
+            .or_else(|| self.identity.get("description").and_then(Value::as_str))
             .filter(|text| !text.trim().is_empty()) {
             parts.push(description.to_owned());
-        } else {
-            parts.push(if self.structured() { "Supports coding tools" } else { "Text generation" }.to_owned());
+        }
+        if self.structured() { parts.push("Supports coding tools".to_owned()); }
+        // The runtime's capability register describes engine implementation,
+        // not model abilities. Only display named, implemented model abilities.
+        if let Some(capabilities) = self.metadata.get("capabilities").and_then(Value::as_array) {
+            for capability in capabilities {
+                if capability.get("state").and_then(Value::as_str) == Some("implemented")
+                    && let Some(name) = capability.get("name").and_then(Value::as_str)
+                        .filter(|name| !name.trim().is_empty())
+                    && !parts.iter().any(|part| part == name) {
+                    parts.push(name.to_owned());
+                }
+            }
         }
         if let Some(context) = self.context_window() {
             parts.push(format!("{context} token context"));
         }
         parts.join(" · ")
     }
+}
+
+/// Resolve a preference against this authenticated discovery response only.
+/// identity.id is the package's logical identity; root is one immutable artifact.
+/// Cadenza/1 currently has no active/default deployment selector, so a missing
+/// root can migrate only to a single advertised deployment with that same ID.
+pub fn resolve_selection(models: &[ModelSelection], selected: &ModelSelection) -> Result<ModelSelection> {
+    ensure!(!selected.logical_id().is_empty(), "Saved Cadenza model has no logical identity");
+    if let Some(current) = models.iter().find(|model| model.root == selected.root) {
+        ensure!(current.identity == selected.identity,
+            "Cadenza model identity changed for the selected root");
+        return Ok(current.clone());
+    }
+    let mut candidates = models.iter().filter(|model| model.logical_id() == selected.logical_id());
+    let current = candidates.next()
+        .context("Selected Cadenza model is unavailable; its logical identity is no longer served")?;
+    ensure!(candidates.next().is_none(),
+        "Cadenza model selection is ambiguous: multiple deployments share the saved logical identity and no active deployment is designated; choose with /model");
+    Ok(current.clone())
 }
 
 pub fn endpoint(settings: &CadenzaSettings) -> Result<tungstenite::http::Uri> {
@@ -314,7 +338,11 @@ impl Client {
         Ok(event)
     }
     pub fn validate_selection(&mut self, selected: &ModelSelection) -> Result<ModelSelection> {
-        let current=self.discover()?.into_iter().find(|m|m.root==selected.root).context("Selected Cadenza model is unavailable; restore it in Cadenza or select another model with /model")?;
+        let current = resolve_selection(&self.discover()?, selected)?;
+        // An in-flight turn is pinned to the deployment used to construct its
+        // context. Never silently change its capabilities or recorded identity.
+        ensure!(current.root == selected.root,
+            "Cadenza deployment changed during this request; send your request again to resolve the new deployment");
         ensure!(
             current.identity == selected.identity,
             "Cadenza model identity changed for the selected root"
@@ -577,7 +605,7 @@ mod tests {
         let models = c.discover().unwrap();
         assert_eq!(models.len(), 2);
         assert_eq!(models[1].root, "b".repeat(64));
-        assert_eq!(models[0].description(), "Text generation · 128 token context");
+        assert_eq!(models[0].description(), "Ready · 128 token context");
         c.health().unwrap();
         server.join().unwrap();
     }
@@ -713,6 +741,70 @@ mod tests {
                 .contains("supplied credential")
         );
         assert!(check_error(&json!({"type":"error","code":"invalid_request","message":"context capacity exceeded","retryable":false})).unwrap_err().to_string().contains("context capacity"));
+    }
+    #[test]
+    fn replacement_resolves_by_logical_identity_not_version_or_artifact() {
+        let saved = ModelSelection::from_discovery(fixture('a')).unwrap();
+        let mut replacement = fixture('b');
+        replacement["identity"]["id"] = json!(saved.logical_id());
+        replacement["identity"]["version"] = json!("2");
+        replacement["max_context"] = json!(2048);
+        let replacement = ModelSelection::from_discovery(replacement).unwrap();
+        let unrelated = ModelSelection::from_discovery(fixture('c')).unwrap();
+        let resolved = resolve_selection(&[unrelated, replacement.clone()], &saved).unwrap();
+        assert_eq!(resolved, replacement);
+        assert_eq!(saved.root, "a".repeat(64));
+        assert_eq!(resolved.context_window(), Some(2048));
+    }
+    #[test]
+    fn ambiguous_or_removed_identity_never_selects_another_deployment() {
+        let saved = ModelSelection::from_discovery(fixture('a')).unwrap();
+        let mut first = saved.clone(); first.root = "b".repeat(64);
+        let mut second = saved.clone(); second.root = "c".repeat(64);
+        assert!(resolve_selection(&[first, second], &saved).unwrap_err().to_string().contains("ambiguous"));
+        let unrelated = ModelSelection::from_discovery(fixture('d')).unwrap();
+        assert!(resolve_selection(&[unrelated], &saved).is_err());
+        assert!(resolve_selection(&[], &saved).is_err());
+        let mut duplicate_id = saved.clone(); duplicate_id.root = "e".repeat(64);
+        assert_eq!(resolve_selection(&[duplicate_id, saved.clone()], &saved).unwrap(), saved);
+    }
+    #[test]
+    fn existing_root_cannot_be_reassigned_to_a_different_identity() {
+        let saved = ModelSelection::from_discovery(fixture('a')).unwrap();
+        let mut tampered = saved.clone(); tampered.identity["id"] = json!("another.model");
+        assert!(resolve_selection(&[tampered], &saved).unwrap_err().to_string().contains("identity changed"));
+    }
+    #[test]
+    fn live_readiness_and_context_replace_saved_metadata() {
+        let saved = ModelSelection::from_discovery(fixture('a')).unwrap();
+        let mut live = saved.clone();
+        live.metadata["ready"] = json!(false); live.metadata["max_context"] = json!(1024);
+        let resolved = resolve_selection(&[live], &saved).unwrap();
+        assert!(!resolved.ready());
+        assert_eq!(resolved.context_window(), Some(1024));
+    }
+    #[test]
+    fn advertised_names_are_preserved_and_missing_names_use_full_identity() {
+        let mut value = fixture('a');
+        value["identity"]["id"] = json!("org.Example_model-1B");
+        assert_eq!(ModelSelection::from_discovery(value.clone()).unwrap().label(), "org.Example_model-1B 1");
+        value["name"] = json!("Official Serving Name");
+        value["description"] = json!("Published model description");
+        let model = ModelSelection::from_discovery(value).unwrap();
+        assert_eq!(model.label(), "Official Serving Name 1");
+        assert_eq!(model.description(), "Ready · Published model description · 128 token context");
+    }
+    #[test]
+    fn in_flight_deployment_is_never_silently_replaced() {
+        let (settings, server) = server(|mut ws| {
+            assert_eq!(read(&mut ws)["type"], "discover");
+            let mut replacement = fixture('a'); replacement["root"] = json!("b".repeat(64));
+            send(&mut ws, json!({"type":"models","models":[replacement]}));
+        });
+        let mut c = client(&settings);
+        let saved = ModelSelection::from_discovery(fixture('a')).unwrap();
+        assert!(c.validate_selection(&saved).unwrap_err().to_string().contains("deployment changed"));
+        server.join().unwrap();
     }
     #[test]
     #[ignore = "Requires a real Cadenza service and isolated Echo configuration"]

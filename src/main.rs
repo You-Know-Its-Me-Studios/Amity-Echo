@@ -112,7 +112,7 @@ fn run() -> Result<()> {
         attach_inputs(&mut session, &store, &config, &attachment_paths,
             editor_context_path.as_deref())?;
         let result = {
-            let mut agent = Agent { config: &config, store: &store, session: &mut session,
+            let mut agent = Agent { config: &mut config, store: &store, session: &mut session,
                 events: &mut sink, cancel: cancel.as_ref(), interactive: false };
             agent.instruction(&instruction)
         };
@@ -147,7 +147,7 @@ fn run() -> Result<()> {
                 return Ok(());
             }
             let mut session = current_session(&config, &store)?;
-            let mut agent = Agent { config: &config, store: &store, session: &mut session,
+            let mut agent = Agent { config: &mut config, store: &store, session: &mut session,
                 events: &mut terminal, cancel: cancel.as_ref(), interactive: false };
             agent.status()
         }
@@ -169,7 +169,7 @@ fn run() -> Result<()> {
             let mut session = current_session(&config, &store)?;
             attach_inputs(&mut session, &store, &config, &attachment_paths,
                 editor_context_path.as_deref())?;
-            let mut agent = Agent { config: &config, store: &store, session: &mut session,
+            let mut agent = Agent { config: &mut config, store: &store, session: &mut session,
                 events: &mut terminal, cancel: cancel.as_ref(), interactive: false };
             agent.instruction(&instruction)
         }
@@ -197,8 +197,9 @@ fn current_session(config: &Config, store: &SessionStore) -> Result<Session> {
     let project = active_project(config)?;
     let cwd = env::current_dir()?;
     let cwd = cwd.canonicalize().unwrap_or(cwd);
-    if let Some(session) = store.list(Some(&project.id))?.into_iter()
+    if let Some(mut session) = store.list(Some(&project.id))?.into_iter()
         .find(|session| session_matches_cwd(session, &cwd, &project.path)) {
+        inference::sync_session(config, store, &mut session)?;
         return Ok(session);
     }
     store.create(&project.id, config.cadenza.default_model.clone()).map_err(Into::into)
@@ -208,16 +209,15 @@ fn interactive(config: &mut Config, store: &SessionStore, terminal: &mut Termina
     cancel: &AtomicBool, mut session: Option<Session>) -> Result<()> {
     let mut steward = StewardMonitor::new(config);
     show_session(config, terminal, session.as_ref());
-    let settings=config.cadenza.clone();let selected=session.as_ref().and_then(|s|s.cadenza_model.clone()).or(config.cadenza.default_model.clone());
-    match terminal.wait_for_work(move || {
-        let mut client=inference::Connection::connect(&settings)?;
-        let models=client.discover()?;client.health()?;
-        if let Some(selected)=selected {
-            models.iter().find(|m|m.root==selected.root && m.identity==selected.identity && m.ready())
-                .context("Selected model is unavailable. Use /model to choose another.")?;
-            Ok(None)
-        } else { Ok(Some(inference::available_models_message(models.len()))) }
-    }) {Ok(Some(message))=>terminal.info(&message),Ok(None)=>{},Err(error)=>terminal.warning(&format!("{error:#}"))}
+    if let Some(current) = session.as_mut() {
+        if let Err(error) = refresh_model_selection(config, store, terminal, current) {
+            terminal.connection_warning(&format!("{error:#}"));
+        } else {
+            let project = config.projects.iter().find(|project| project.id == current.project_id)
+                .map(|project| project.name.as_str()).unwrap_or(&current.project_id);
+            terminal.context(project, &current.id, current.model.as_deref().unwrap_or("not configured"));
+        }
+    }
     if let Some(current) = session.as_mut() {
         resume_pending(config, store, terminal, cancel, current);
     }
@@ -434,7 +434,7 @@ fn show_session(config: &Config, terminal: &Terminal, session: Option<&Session>)
     }
 }
 
-fn resume_pending(config: &Config, store: &SessionStore, terminal: &mut Terminal,
+fn resume_pending(config: &mut Config, store: &SessionStore, terminal: &mut Terminal,
     cancel: &AtomicBool, session: &mut Session) {
     let result = match session.status.clone() {
         SessionStatus::AwaitingUserDecision => {
@@ -514,26 +514,56 @@ fn choose_model(config: &mut Config, store: &SessionStore, terminal: &mut Termin
     let settings=config.cadenza.clone();
     let models=terminal.wait_for_work(move || {
         let mut client=inference::Connection::connect(&settings)?;
-        let models=client.model_choices()?; client.health()?; Ok(models)
+        let models = client.model_choices()?;
+        if models.iter().any(|choice| choice.model.ready()) { client.health()?; }
+        Ok(models)
     })?;
     if models.is_empty() { bail!("No models are available right now. Try again later."); }
-    let current=session.cadenza_model.as_ref().or(config.cadenza.default_model.as_ref());
-    let selected=current.and_then(|m|models.iter().position(|candidate|candidate.model.root==m.root)).unwrap_or(0);
-    let Some(candidate)=terminal.choose_model(&models,selected,current)? else {return Ok(());};
+    let registry = models.iter().map(|choice| choice.model.clone()).collect::<Vec<_>>();
+    let current = inference::preferred_model(config, session)
+        .map(|saved| inference::resolve_selection(&registry, saved)).transpose();
+    let current = match current {
+        Ok(Some(model)) if model.ready() => {
+            inference::persist_selection(config, store, session, model.clone())?;
+            terminal.context(&session.project_id, &session.id, &model.label());
+            Some(model)
+        }
+        Ok(_) => None,
+        Err(error) => { terminal.warning(&format!("{error:#}")); None }
+    };
+    let selected=current.as_ref().and_then(|m|models.iter().position(|candidate|candidate.model.root==m.root)).unwrap_or(0);
+    let Some(candidate)=terminal.choose_model(&models,selected,current.as_ref())? else {return Ok(());};
     if !candidate.ready() {bail!("This model is not ready. Choose another model or try again later.");}
     let settings=config.cadenza.clone();let requested=candidate.clone();
     let candidate=terminal.wait_for_work(move || {
         let mut client=inference::Connection::connect(&settings)?;
-        client.validate_selection(&requested)
+        let candidate = client.validate_selection(&requested)?;
+        client.health()?;
+        Ok(candidate)
     })?;
-    let mut next=config.clone(); next.cadenza.default_model=Some(candidate.clone());
-    let mut next_session=session.clone(); next_session.select_cadenza_model(candidate.clone());
-    // Save both before replacing live state; restore the previous global default on session write failure.
-    next.save()?;
-    if let Err(error)=store.save(&next_session) {config.save()?; return Err(error.into());}
-    *config=next; *session=next_session;
+    inference::persist_selection(config, store, session, candidate.clone())?;
     terminal.context(&session.project_id,&session.id,&candidate.label());
     terminal.info(&format!("Model Switched to {}",candidate.label()));
+    Ok(())
+}
+
+fn refresh_model_selection(config: &mut Config, store: &SessionStore, terminal: &mut Terminal,
+    session: &mut Session) -> Result<()> {
+    let settings = config.cadenza.clone();
+    let selected = inference::preferred_model(config, session).cloned();
+    let (selected, count) = terminal.wait_for_work(move || {
+        let mut client = inference::Connection::connect(&settings)?;
+        let models = client.discover()?;
+        let current = selected.as_ref().map(|saved| inference::resolve_selection(&models, saved)).transpose()?;
+        if let Some(model) = &current {
+            if !model.ready() { bail!("Selected Cadenza model is not ready; try again when it becomes available"); }
+            client.health()?;
+        }
+        Ok((current, models.iter().filter(|model| model.ready()).count()))
+    })?;
+    if let Some(model) = selected {
+        inference::persist_selection(config, store, session, model)?;
+    } else { terminal.info(&inference::available_models_message(count)); }
     Ok(())
 }
 
@@ -820,7 +850,11 @@ fn on_off(value: bool) -> &'static str { if value { "On" } else { "Off" } }
 fn browse_session(config: &Config, store: &SessionStore, terminal: &mut Terminal) -> Result<Option<Session>> {
     let entries = session_picker_entries(config, store)?;
     match terminal.choose_session(&entries)? {
-        Some(id) => Ok(Some(store.load(&id)?)),
+        Some(id) => {
+            let mut session = store.load(&id)?;
+            inference::sync_session(config, store, &mut session)?;
+            Ok(Some(session))
+        }
         None => Ok(None),
     }
 }

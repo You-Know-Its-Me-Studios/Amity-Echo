@@ -116,7 +116,7 @@ pub struct Terminal {
 }
 
 #[derive(Clone, Copy)]
-enum Tone { Brand, Muted, User, Assistant, Info, Warning, Error, Operation, Tool, Code }
+enum Tone { Brand, Muted, User, Assistant, Info, Warning, ConnectionWarning, Error, Operation, Tool, Code }
 
 struct ScreenLine { text: String, tone: Tone, temporary: bool }
 
@@ -493,7 +493,8 @@ impl Terminal {
         if models.is_empty(){return Ok(None);}
         let choices: Vec<_> = models.iter().map(|choice| MenuChoice {
             command: format!("{}{}", choice.model.label(),
-                if current.is_some_and(|m| m.root == choice.model.root) { " (current)" } else { "" }),
+                if choice.model.ready() && current.is_some_and(|m| m.root == choice.model.root
+                    && m.identity == choice.model.identity) { " (current)" } else { "" }),
             description: choice.model.description(),
         }).collect();
         terminal::enable_raw_mode()?;
@@ -1496,6 +1497,9 @@ impl Terminal {
                 screen.project = project.to_owned();
                 screen.session = session.to_owned();
                 screen.model = model.to_owned();
+                screen.stream_start = screen.stream_start.map(|start| screen.lines.iter()
+                    .take(start).filter(|line| !matches!(line.tone, Tone::ConnectionWarning)).count());
+                screen.lines.retain(|line| !matches!(line.tone, Tone::ConnectionWarning));
             }
             let _ = self.draw();
             return;
@@ -1544,6 +1548,12 @@ impl Terminal {
         let message = crate::inference::user_message(message);
         if self.screen.is_some() { self.log(message, Tone::Warning); return; }
         eprintln!("{} {}", self.paint("!", "1;33"), Self::clean(&crate::state::redact_credentials(message)));
+    }
+
+    pub fn connection_warning(&self, message: &str) {
+        if self.screen.is_some() {
+            self.log(crate::inference::user_message(message), Tone::ConnectionWarning);
+        } else { self.warning(message); }
     }
 
     pub fn error(&self, message: &str) {
@@ -1925,7 +1935,7 @@ impl Tone {
             Self::User => Color::White,
             Self::Assistant => Color::White,
             Self::Info => Color::Blue,
-            Self::Warning => Color::Yellow,
+            Self::Warning | Self::ConnectionWarning => Color::Yellow,
             Self::Error => Color::Red,
             Self::Operation => Color::Magenta,
             Self::Tool => Color::Green,

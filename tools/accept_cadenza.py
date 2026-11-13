@@ -90,7 +90,7 @@ def main():
         terminal=Terminal(executable,work,env);terminal.wait('1 model available. Use /model to select.')
         assert (home/'config.pre-cadenza.json').read_bytes()==initial_bytes
         assert all('models' not in p and 'selected_model' not in p for p in json.loads((home/'config.json').read_text(encoding='utf-8'))['projects'])
-        terminal.type('/model\r');screen=terminal.wait('Select Model and Effort');assert 'Text generation' in screen
+        terminal.type('/model\r');screen=terminal.wait('Select Model and Effort');assert 'Ready' in screen
         (output/'picker.txt').write_text(screen,encoding='utf-8');terminal.type('\r');wait_config(home,lambda c:(c['cadenza'].get('default_model') or {}).get('root')==models[0]['root']);time.sleep(.2)
         saved=json.loads((home/'config.json').read_text(encoding='utf-8'));assert saved['cadenza']['default_model']['root']==models[0]['root']
         terminal.type('/model\r');terminal.wait('(current)');terminal.type('\x1b');time.sleep(.3)

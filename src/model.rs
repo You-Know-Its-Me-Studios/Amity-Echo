@@ -61,12 +61,12 @@ impl ChatModel {
             .or(config.cadenza.default_model.as_ref())
             .context("No Cadenza model selected. Open /model to discover and choose a model")?
             .clone();
-        ensure!(
-            selected.ready(),
-            "Selected Cadenza model is not ready; open /model when it becomes available"
-        );
         let mut settings = config.cadenza.clone();
         settings.request_timeout_seconds = timeout.as_secs().clamp(1, 300);
+        let mut client = Connection::connect(&settings)?;
+        let selected = crate::inference::resolve_selection(&client.discover()?, &selected)?;
+        ensure!(selected.ready(), "Selected Cadenza model is not ready; try again when it becomes available");
+        client.health()?;
         Ok(Self {
             version: selected.label(),
             selected,
@@ -250,6 +250,7 @@ pub fn host_turn(args: &[String]) -> Result<()> {
         Some(&selected),
         Duration::from_secs(config.cadenza.request_timeout_seconds),
     )?;
+    ensure!(model.selected.root == args[0], "Cadenza deployment changed during this request");
     let turn = model.complete_streaming(&input, &AtomicBool::new(false), |_| {})?;
     let value = match turn {
         ModelTurn::Text { text } | ModelTurn::FinalProposal { proposal: text } => {

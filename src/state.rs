@@ -66,13 +66,21 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn select_cadenza_model(&mut self, model: crate::inference::ModelSelection) {
-        if self.model_history.is_empty() {
-            if let Some(previous)=&self.model { self.model_history.push(ModelChange {message_index:0,label:previous.clone(),root:self.cadenza_model.as_ref().map(|m|m.root.clone())}); }
+    pub fn select_cadenza_model(&mut self, model: crate::inference::ModelSelection) -> bool {
+        if self.cadenza_model.as_ref() == Some(&model) && self.model.as_deref() == Some(model.label().as_str())
+            && self.context_window == model.context_window() { return false; }
+        let deployment_changed = self.cadenza_model.as_ref()
+            .is_none_or(|previous| previous.root != model.root || previous.identity != model.identity);
+        if deployment_changed {
+            if self.model_history.is_empty() {
+                if let Some(previous)=&self.model { self.model_history.push(ModelChange {message_index:0,label:previous.clone(),root:self.cadenza_model.as_ref().map(|m|m.root.clone())}); }
+            }
+            self.model_history.push(ModelChange {message_index:self.messages.len(),label:model.label(),root:Some(model.root.clone())});
+            self.last_input_tokens=None;
         }
-        self.model_history.push(ModelChange {message_index:self.messages.len(),label:model.label(),root:Some(model.root.clone())});
-        self.model=Some(model.label()); self.context_window=model.context_window(); self.last_input_tokens=None;
+        self.model=Some(model.label()); self.context_window=model.context_window();
         self.cadenza_model=Some(model); self.updated_at_ms=now_ms();
+        true
     }
     pub fn append_message(&mut self, role: MessageRole, content: impl AsRef<str>) {
         self.messages.push(Message {
@@ -151,6 +159,7 @@ impl SessionStore {
         let working_directory = Some(cwd.canonicalize().unwrap_or(cwd));
         let session = Session {
             id: new_id(), project_id: project_id.to_owned(), working_directory, model:model.as_ref().map(|m|m.label()),
+            context_window: model.as_ref().and_then(|model| model.context_window()),
             cadenza_model:model,model_history:Vec::new(),
             created_at_ms: now, updated_at_ms: now,
             status: SessionStatus::Idle, messages: Vec::new(), task_ids: Vec::new(),
@@ -159,7 +168,7 @@ impl SessionStore {
             pending_denial: None,
             pending_instruction: None, agent_task: false,
             usage_input_tokens: 0, usage_output_tokens: 0,
-            usage_cost_usd: 0.0, context_window: None,
+            usage_cost_usd: 0.0,
             last_input_tokens: None, usage_cost_reported: false,
             context_summary: None, compacted_messages: 0,
             pending_attachments: Vec::new(),
@@ -392,5 +401,33 @@ mod cadenza_tests {
     }
     #[test] fn cadenza_credential_is_redacted(){
         assert_eq!(redact_credentials("CADENZA_API_TOKEN=private-value"),"[redacted credential]");
+    }
+    #[test]
+    fn global_selection_updates_reopened_conversation_without_rewriting_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default(); config.session_dir = dir.path().join("sessions");
+        let store = SessionStore::new(&config).unwrap();
+        let original = crate::cadenza::ModelSelection::from_discovery(serde_json::json!({
+            "identity":{"id":"example.model","version":"1"},"root":"a".repeat(64),"ready":true,"max_context":128
+        })).unwrap();
+        let mut session = store.create("project", Some(original.clone())).unwrap();
+        session.append_message(MessageRole::Assistant, "Original answer"); store.save(&session).unwrap();
+        let historical = serde_json::to_value(&session.messages).unwrap();
+        let mut replacement = original; replacement.root = "b".repeat(64);
+        replacement.metadata["root"] = serde_json::json!(replacement.root);
+        replacement.metadata["max_context"] = serde_json::json!(2048);
+        config.cadenza.default_model = Some(replacement.clone());
+        assert_eq!(crate::inference::preferred_model(&config, &session), Some(&replacement));
+        crate::inference::sync_session(&config, &store, &mut session).unwrap();
+        assert_eq!(serde_json::to_value(&session.messages).unwrap(), historical);
+        assert_eq!(session.context_window, Some(2048));
+        assert_eq!(session.model_history.len(), 2);
+        crate::inference::sync_session(&config, &store, &mut session).unwrap();
+        assert_eq!(session.model_history.len(), 2);
+        session.append_message(MessageRole::Assistant, "New answer"); store.save(&session).unwrap();
+        let loaded = store.load(&session.id).unwrap();
+        assert_eq!(loaded.messages[0].model_root.as_deref(), Some("a".repeat(64).as_str()));
+        assert_eq!(loaded.messages[1].model_root.as_deref(), Some("b".repeat(64).as_str()));
+        assert_eq!(loaded.cadenza_model, config.cadenza.default_model);
     }
 }
