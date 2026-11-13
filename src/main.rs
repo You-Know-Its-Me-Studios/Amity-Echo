@@ -36,7 +36,7 @@ fn main() {
         if env::args().any(|argument| argument == "--json") {
             println!("{}", serde_json::json!({"type":"result","status":"failed",
                 "exit_code":1,"error":message}));
-        } else { eprintln!("echocli: {message}"); }
+        } else { eprintln!("echocli: {}", inference::user_message(&message)); }
         std::process::exit(1);
     }
 }
@@ -212,9 +212,12 @@ fn interactive(config: &mut Config, store: &SessionStore, terminal: &mut Termina
     match terminal.wait_for_work(move || {
         let mut client=inference::Connection::connect(&settings)?;
         let models=client.discover()?;client.health()?;
-        if let Some(selected)=selected {let current=models.iter().find(|m|m.root==selected.root && m.identity==selected.identity && m.ready()).context("Selected Cadenza model is unavailable; open /model")?;Ok(format!("Cadenza ready · {}",current.label()))}
-        else {Ok(format!("Cadenza connected · {} available model(s). Open /model to choose the global default.",models.len()))}
-    }) {Ok(message)=>terminal.info(&message),Err(error)=>terminal.warning(&format!("{error:#}. Echo remains usable."))}
+        if let Some(selected)=selected {
+            models.iter().find(|m|m.root==selected.root && m.identity==selected.identity && m.ready())
+                .context("Selected model is unavailable. Use /model to choose another.")?;
+            Ok(None)
+        } else { Ok(Some(inference::available_models_message(models.len()))) }
+    }) {Ok(Some(message))=>terminal.info(&message),Ok(None)=>{},Err(error)=>terminal.warning(&format!("{error:#}"))}
     if let Some(current) = session.as_mut() {
         resume_pending(config, store, terminal, cancel, current);
     }
@@ -502,11 +505,11 @@ fn choose_model(config: &mut Config, store: &SessionStore, terminal: &mut Termin
         let mut client=inference::Connection::connect(&settings)?;
         let models=client.model_choices()?; client.health()?; Ok(models)
     })?;
-    if models.is_empty() { bail!("Cadenza returned no models; the existing selection was preserved"); }
+    if models.is_empty() { bail!("No models are available right now. Try again later."); }
     let current=session.cadenza_model.as_ref().or(config.cadenza.default_model.as_ref());
     let selected=current.and_then(|m|models.iter().position(|candidate|candidate.model.root==m.root)).unwrap_or(0);
     let Some(candidate)=terminal.choose_model(&models,selected,current)? else {return Ok(());};
-    if !candidate.ready() {bail!("This Cadenza model is not ready. The existing selection was preserved");}
+    if !candidate.ready() {bail!("This model is not ready. Choose another model or try again later.");}
     let settings=config.cadenza.clone();let requested=candidate.clone();
     let candidate=terminal.wait_for_work(move || {
         let mut client=inference::Connection::connect(&settings)?;
@@ -519,22 +522,22 @@ fn choose_model(config: &mut Config, store: &SessionStore, terminal: &mut Termin
     if let Err(error)=store.save(&next_session) {config.save()?; return Err(error.into());}
     *config=next; *session=next_session;
     terminal.context(&session.project_id,&session.id,&candidate.label());
-    terminal.info(&format!("Using {} through Cadenza. Saved as the global default.",candidate.label()));
+    terminal.info(&format!("Model Switched to {}",candidate.label()));
     Ok(())
 }
 
 fn configure_cadenza(config:&mut Config,terminal:&mut Terminal)->Result<bool> {
     let options=[
-        MenuChoice {command:"Server URL".into(),description:config.cadenza.endpoint.clone()},
-        MenuChoice {command:"Authentication source".into(),description:config.cadenza.credential_ref.clone()},
+        MenuChoice {command:"Server URL".into(),description:"Change the model service address".into()},
+        MenuChoice {command:"Authentication source".into(),description:"Change where Echo reads your access credential".into()},
         MenuChoice {command:"Maximum generated tokens".into(),description:config.cadenza.max_tokens.to_string()},
     ];
-    let Some(choice)=terminal.choose_option("Cadenza connection",&options)? else{return Ok(false);};
+    let Some(choice)=terminal.choose_option("Model connection",&options)? else{return Ok(false);};
     match choice {
-        0=>if let Some(value)=terminal.prompt_text("Cadenza WebSocket URL (ws://127.0.0.1:7941/cadenza)")?{
+        0=>if let Some(value)=terminal.prompt_text("Model service URL")?{
             config.cadenza.endpoint=value.trim().to_owned();inference::validate_endpoint(&config.cadenza)?;
         }else{return Ok(false);},
-        1=>if let Some(value)=terminal.prompt_text("Credential source (env:NAME or windows:Amity/Echo/Cadenza/name)")?{
+        1=>if let Some(value)=terminal.prompt_text("Authentication source (env:NAME or windows:TARGET)")?{
             let value=value.trim();
             if let Some(name)=value.strip_prefix("env:"){credentials::validate_env(name)?;}
             else if !value.starts_with("windows:Amity/Echo/Cadenza/"){bail!("Choose an environment or Echo Windows credential reference");}
@@ -570,7 +573,7 @@ fn choose_settings(config: &mut Config, terminal: &mut Terminal) -> Result<()> {
                 description: "Connect or remove external development services".into() },
             MenuChoice { command: "Capabilities".into(),
                 description: "Choose which engineering features Echo can use".into() },
-            MenuChoice {command:"Cadenza connection".into(),description:config.cadenza.endpoint.clone()},
+            MenuChoice {command:"Model connection".into(),description:"Manage model access and response limits".into()},
         ];
         let Some(index) = terminal.choose_option("Echo settings", &options)? else { return Ok(()); };
         let mut next = config.clone();

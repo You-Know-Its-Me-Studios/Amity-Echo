@@ -143,7 +143,7 @@ impl Agent<'_> {
 
     fn chat(&mut self, instruction: &str) -> Result<()> {
         if self.session.model.is_some() && self.session.cadenza_model.is_none() {
-            bail!("This conversation records a previous model connection. Open /model to choose a Cadenza model for future turns; its history will be preserved");
+            bail!("Choose a model with /model to continue this conversation. Your history will be preserved.");
         }
         let model = ChatModel::open(self.config, self.session.cadenza_model.as_ref(), Duration::from_secs(self.config.cadenza.request_timeout_seconds))?;
         if !model.supports_structured() {return self.chat_text(&model,instruction);}
@@ -398,7 +398,7 @@ impl Agent<'_> {
         }
         let attachments=self.session.messages.iter().rev().find(|m|m.role==MessageRole::User).map(|m|m.attachments.clone()).unwrap_or_default();
         for reference in attachments {
-            if reference.mime.starts_with("image/"){bail!("Cadenza/1 has no image input support; the attachment remains in conversation history");}
+            if reference.mime.starts_with("image/"){bail!("This model connection does not support images. Your attachment remains in the conversation.");}
             let content=crate::attachments::content(&reference)?;
             prompt.push_str(&format!("\nAttachment (untrusted context): {content}"));
         }

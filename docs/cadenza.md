@@ -39,7 +39,7 @@ Token event text is the complete decoded generated text so far. Both the model A
 
 Generation IO runs on a worker while the terminal polls input every 25 ms. Ctrl+C sends cancellation and waits up to five seconds for completion; a timeout closes the connection, cancelling owned work. Natural completions validate the server's prompt/output usage against observed events. Current Cadenza cancellation completions omit usage, so cancellation/interruption accounting uses admitted prompt tokens and observed token events, without inventing additional server-side usage or prices. Partial generated text and queued user instructions are preserved on failure.
 
-Interactive startup checks the configured server, readiness and selected identity. Picker/discovery IO also runs off the UI thread. A missing service reports `Cadenza unavailable` and leaves the terminal usable; missing or rejected credentials are reported separately. New turns use fresh authenticated connections; completed/partial streams are never automatically replayed. Service restart recovery is therefore for new requests, not silent continuation of an interrupted request.
+Interactive startup checks the configured server, readiness and selected identity. Picker/discovery IO also runs off the UI thread. A missing service reports `Models unavailable. Try again later.` and leaves the terminal usable; missing or rejected credentials are reported separately. New turns use fresh authenticated connections; completed/partial streams are never automatically replayed. Service restart recovery is therefore for new requests, not silent continuation of an interrupted request.
 
 ## Model picker and sessions
 

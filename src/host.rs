@@ -179,8 +179,8 @@ impl HostClient {
         let mut native_binding=None;
         let mut credential=None;
         if command=="task-run" {
-            let config=crate::config::Config::load().map_err(|_|HostError::Configuration("Could not load global Cadenza settings".into()))?;
-            let selected=self.native_model.as_ref().or(config.cadenza.default_model.as_ref()).ok_or_else(||HostError::Configuration("Choose a Cadenza model with /model before running an Amity task".into()))?;
+            let config=crate::config::Config::load().map_err(|_|HostError::Configuration("Could not load model settings".into()))?;
+            let selected=self.native_model.as_ref().or(config.cadenza.default_model.as_ref()).ok_or_else(||HostError::Configuration("Choose a model with /model before continuing".into()))?;
             let bytes=fs::read(&self.config_path).map_err(|e|HostError::Configuration(e.to_string()))?;
             let mut binding:Value=serde_json::from_slice(&bytes).map_err(|e|HostError::Configuration(e.to_string()))?;
             let fields=binding.as_object_mut().ok_or_else(||HostError::Configuration("Invalid Amity binding".into()))?;

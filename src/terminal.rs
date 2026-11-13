@@ -348,7 +348,7 @@ impl Terminal {
                     }
                     MessageRole::System => {
                         Self::append_screen_lines(&mut screen, "SYSTEM", Tone::Warning);
-                        Self::append_screen_lines(&mut screen, &message.content, Tone::Info);
+                        Self::append_screen_lines(&mut screen, crate::inference::user_message(&message.content), Tone::Info);
                     }
                 }
             }
@@ -392,13 +392,13 @@ impl Terminal {
             std::thread::sleep(Duration::from_millis(25));
         }
         self.end_busy()?;
-        let result=worker.join().map_err(|_|anyhow::anyhow!("Cadenza connection worker failed"))?;
-        if cancelled {anyhow::bail!("Cadenza connection cancelled; settings unchanged");} result
+        let result=worker.join().map_err(|_|anyhow::anyhow!("Could not connect to the model. Try again."))?;
+        if cancelled {anyhow::bail!("Model selection cancelled.");} result
     }
 
     pub fn choose_model(&mut self, models: &[crate::inference::ModelChoice], initial: usize,
         current: Option<&crate::inference::ModelSelection>) -> Result<Option<crate::inference::ModelSelection>> {
-        if self.screen.is_none(){anyhow::bail!("Open Echo's interactive terminal to choose a Cadenza model");}
+        if self.screen.is_none(){anyhow::bail!("Open Echo's interactive terminal to choose a model.");}
         if models.is_empty(){return Ok(None);}
         let choices: Vec<_> = models.iter().map(|choice| MenuChoice {
             command: format!("{}{}", choice.model.label(),
@@ -1428,11 +1428,13 @@ impl Terminal {
     }
 
     pub fn warning(&self, message: &str) {
+        let message = crate::inference::user_message(message);
         if self.screen.is_some() { self.log(message, Tone::Warning); return; }
         eprintln!("{} {}", self.paint("!", "1;33"), Self::clean(&crate::state::redact_credentials(message)));
     }
 
     pub fn error(&self, message: &str) {
+        let message = crate::inference::user_message(message);
         if self.screen.is_some() { self.log(message, Tone::Error); return; }
         eprintln!("{} {}", self.paint("Error:", "1;31"), Self::clean(&crate::state::redact_credentials(message)));
     }

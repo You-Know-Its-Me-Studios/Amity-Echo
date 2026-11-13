@@ -75,11 +75,11 @@ def main():
         # cancellation, usage, reconnect, bad auth and missing model rejection.
         with (output/'protocol-tests.txt').open('w',encoding='utf-8') as log:
             subprocess.run(['cargo','test','--locked','cadenza::tests::real_cadenza_acceptance','--','--ignored','--nocapture'],cwd=root,env=env,stdout=log,stderr=subprocess.STDOUT,check=True,timeout=180)
-        terminal=Terminal(executable,work,env);terminal.wait('Cadenza connected')
+        terminal=Terminal(executable,work,env);terminal.wait('1 model available. Use /model to select.')
         assert (home/'config.pre-cadenza.json').read_bytes()==initial_bytes
         assert all('models' not in p and 'selected_model' not in p for p in json.loads((home/'config.json').read_text(encoding='utf-8'))['projects'])
         terminal.type('/model\r');screen=terminal.wait('Select Model and Effort');assert 'Text generation' in screen
-        (output/'picker.txt').write_text(screen,encoding='utf-8');terminal.type('\r');terminal.wait('Saved as the global default')
+        (output/'picker.txt').write_text(screen,encoding='utf-8');terminal.type('\r');terminal.wait('Model Switched to ')
         saved=json.loads((home/'config.json').read_text(encoding='utf-8'));assert saved['cadenza']['default_model']['root']==models[0]['root']
         terminal.type('/model\r');terminal.wait('(current)');terminal.type('\x1b');time.sleep(.3)
         assert json.loads((home/'config.json').read_text(encoding='utf-8'))['cadenza']==saved['cadenza']
@@ -111,13 +111,13 @@ def main():
         (output/'cross-directory.json').write_text(json.dumps(events,indent=2),encoding='utf-8')
         for session_path in (home/'sessions').glob('*.json'):
             session=json.loads(session_path.read_text(encoding='utf-8'));assert session['cadenza_model']['root']==models[0]['root']
-        terminal=Terminal(executable,other,env);terminal.wait('Cadenza ready');terminal.type('/model\r');screen=terminal.wait('(current)');(output/'restart-picker.txt').write_text(screen,encoding='utf-8');terminal.type('\x1b');time.sleep(.2);terminal.stop();terminal=None
+        terminal=Terminal(executable,other,env);terminal.wait('Ready');terminal.type('/model\r');screen=terminal.wait('(current)');(output/'restart-picker.txt').write_text(screen,encoding='utf-8');terminal.type('\x1b');time.sleep(.2);terminal.stop();terminal=None
         desktop=Path.home()/'Desktop'
         no_credential_env=dict(env);no_credential_env.pop(configuration['api_token_env'],None)
-        terminal=Terminal(executable,desktop,no_credential_env);terminal.wait('Cadenza credential unavailable');terminal.stop();terminal=None
+        terminal=Terminal(executable,desktop,no_credential_env);terminal.wait('Model authentication is unavailable.');terminal.stop();terminal=None
         # Unavailable service: UI stays usable, picker errors, selection is unchanged.
         service.terminate();service.wait(timeout=15)
-        terminal=Terminal(executable,desktop,no_credential_env);terminal.wait('Cadenza unavailable');terminal.type('/model\r');screen=terminal.wait('Cadenza unavailable');(output/'offline-picker.txt').write_text(screen,encoding='utf-8')
+        terminal=Terminal(executable,desktop,no_credential_env);terminal.wait('Models unavailable. Try again later.');terminal.type('/model\r');screen=terminal.wait('Models unavailable. Try again later.');(output/'offline-picker.txt').write_text(screen,encoding='utf-8')
         assert json.loads((home/'config.json').read_text(encoding='utf-8'))['cadenza']['default_model']['root']==models[0]['root']
         terminal.stop();terminal=None
         service=subprocess.Popen([str(cadenza/'target/release/cadenza.exe'),'serve','--config',str(Path(a.cadenza_config).resolve())],cwd=output,env=env,stdout=service_log,stderr=subprocess.STDOUT)
@@ -136,7 +136,7 @@ def main():
         protocol=json.loads((output/'protocol.json').read_text(encoding='utf-8'))
         cancel_config['cadenza']['max_tokens']=min(256,models[0]['max_context']-protocol['prompt_tokens'])
         (home/'config.json').write_text(json.dumps(cancel_config),encoding='utf-8');cancel_work=output/'cancel-workspace';cancel_work.mkdir()
-        terminal=Terminal(executable,cancel_work,env);terminal.wait('Cadenza ready');terminal.type('The meaning of life is\r');terminal.wait('that it',timeout=15);terminal.type('\x03')
+        terminal=Terminal(executable,cancel_work,env);terminal.wait('Ready');terminal.type('The meaning of life is\r');terminal.wait('that it',timeout=15);terminal.type('\x03')
         screen=terminal.wait('Cadenza generation cancelled',timeout=15);(output/'cancel-screen.txt').write_text(screen,encoding='utf-8');terminal.stop();terminal=None
         cancelled=[json.loads(p.read_text(encoding='utf-8')) for p in (home/'sessions').glob('*.json') if 'cancel-workspace' in json.loads(p.read_text(encoding='utf-8')).get('working_directory','')]
         assert len(cancelled)==1 and cancelled[0]['status']=='interrupted' and cancelled[0]['usage_output_tokens']>0
