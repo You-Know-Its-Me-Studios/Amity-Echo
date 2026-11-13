@@ -2,7 +2,6 @@ mod agent;
 mod attachments;
 mod cadenza;
 mod credentials;
-mod development;
 mod capabilities;
 mod commands;
 mod config;
@@ -215,7 +214,7 @@ fn interactive(config: &mut Config, store: &SessionStore, terminal: &mut Termina
         let models=client.discover()?;client.health()?;
         if let Some(selected)=selected {let current=models.iter().find(|m|m.root==selected.root && m.identity==selected.identity && m.ready()).context("Selected Cadenza model is unavailable; open /model")?;Ok(format!("Cadenza ready · {}",current.label()))}
         else {Ok(format!("Cadenza connected · {} available model(s). Open /model to choose the global default.",models.len()))}
-    }) {Ok(message)=>terminal.info(&message),Err(error)=>terminal.warning(&format!("Inference unavailable: {error:#}. Echo remains usable."))}
+    }) {Ok(message)=>terminal.info(&message),Err(error)=>terminal.warning(&format!("{error:#}. Echo remains usable."))}
     if let Some(current) = session.as_mut() {
         resume_pending(config, store, terminal, cancel, current);
     }
@@ -527,26 +526,22 @@ fn choose_model(config: &mut Config, store: &SessionStore, terminal: &mut Termin
 
 fn configure_cadenza(config:&mut Config,terminal:&mut Terminal)->Result<bool> {
     let options=[
-        MenuChoice {command:"Development service executable".into(),description:config.cadenza.development_executable.as_ref().map(|p|p.display().to_string()).unwrap_or_else(||"Not configured".into())},
-        MenuChoice {command:"Development service configuration".into(),description:config.cadenza.development_config.as_ref().map(|p|p.display().to_string()).unwrap_or_else(||"Not configured".into())},
-        MenuChoice {command:"Development endpoint".into(),description:config.cadenza.endpoint.clone()},
+        MenuChoice {command:"Server URL".into(),description:config.cadenza.endpoint.clone()},
+        MenuChoice {command:"Authentication source".into(),description:config.cadenza.credential_ref.clone()},
         MenuChoice {command:"Maximum generated tokens".into(),description:config.cadenza.max_tokens.to_string()},
     ];
-    let Some(choice)=terminal.choose_option("Local development inference",&options)? else{return Ok(false);};
+    let Some(choice)=terminal.choose_option("Cadenza connection",&options)? else{return Ok(false);};
     match choice {
-        0|1=>{
-            let label=if choice==0{"Path to the Cadenza executable"}else{"Path to the Cadenza development JSON configuration"};
-            let Some(value)=terminal.prompt_text(label)? else{return Ok(false);};
-            let value=value.trim().trim_matches('"');
-            if value.is_empty(){return Ok(false);}
-            let path=PathBuf::from(value).canonicalize().with_context(||format!("File is unavailable: {value}"))?;
-            if !path.is_file(){bail!("Choose an existing file");}
-            if choice==0{config.cadenza.development_executable=Some(path);}else{config.cadenza.development_config=Some(path);}
-        },
-        2=>if let Some(value)=terminal.prompt_text("Loopback development endpoint (ws://127.0.0.1:7941/cadenza)")?{
+        0=>if let Some(value)=terminal.prompt_text("Cadenza WebSocket URL (ws://127.0.0.1:7941/cadenza)")?{
             config.cadenza.endpoint=value.trim().to_owned();inference::validate_endpoint(&config.cadenza)?;
         }else{return Ok(false);},
-        3=>if let Some(value)=terminal.prompt_text("Maximum generated tokens (1..256; prompt plus output must fit the selected model)")?{
+        1=>if let Some(value)=terminal.prompt_text("Credential source (env:NAME or windows:Amity/Echo/Cadenza/name)")?{
+            let value=value.trim();
+            if let Some(name)=value.strip_prefix("env:"){credentials::validate_env(name)?;}
+            else if !value.starts_with("windows:Amity/Echo/Cadenza/"){bail!("Choose an environment or Echo Windows credential reference");}
+            config.cadenza.credential_ref=value.to_owned();
+        }else{return Ok(false);},
+        2=>if let Some(value)=terminal.prompt_text("Maximum generated tokens (1..256; prompt plus output must fit the selected model)")?{
             let count=value.trim().parse::<u16>().context("Enter an integer from 1 to 256")?;if !(1..=256).contains(&count){bail!("Enter an integer from 1 to 256");}config.cadenza.max_tokens=count;
         }else{return Ok(false);},_=>unreachable!(),
     }
@@ -576,7 +571,7 @@ fn choose_settings(config: &mut Config, terminal: &mut Terminal) -> Result<()> {
                 description: "Connect or remove external development services".into() },
             MenuChoice { command: "Capabilities".into(),
                 description: "Choose which engineering features Echo can use".into() },
-            MenuChoice {command:"Local development inference".into(),description:"Choose a Cadenza installation; Echo handles its credential".into()},
+            MenuChoice {command:"Cadenza connection".into(),description:config.cadenza.endpoint.clone()},
         ];
         let Some(index) = terminal.choose_option("Echo settings", &options)? else { return Ok(()); };
         let mut next = config.clone();

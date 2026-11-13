@@ -2,7 +2,7 @@
   "name": "amity-echo-editor",
   "displayName": "Amity Echo",
   "description": "Send the active file, selection, and diagnostics to Amity Echo.",
-  "version": "0.3.7",
+  "version": "0.3.8",
   "publisher": "you-know-its-me-studios",
   "repository": {
     "type": "git",

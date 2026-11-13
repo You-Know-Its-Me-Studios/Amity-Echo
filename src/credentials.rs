@@ -1,36 +1,6 @@
 //! References only in configuration; secrets come from environment or OS vault.
 use anyhow::{Context, Result, bail, ensure};
 
-pub const DEVELOPMENT_REFERENCE: &str = "windows:Amity/Echo/Cadenza/development";
-
-/// Called only while Echo holds the development startup lock. A pre-existing
-/// credential is never replaced, including when a service refuses it.
-pub fn provision_development() -> Result<String> {
-    #[cfg(windows)]
-    {
-        let target = DEVELOPMENT_REFERENCE.strip_prefix("windows:").unwrap();
-        if let Some(secret) = vault::read_optional(target)? {
-            return Ok(secret);
-        }
-        let mut random = [0u8; 32];
-        getrandom::fill(&mut random).context("generating a development service credential")?;
-        let secret = random.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
-        vault::write(target, &secret)?;
-        Ok(secret)
-    }
-    #[cfg(not(windows))]
-    {
-        bail!("Automatic development credentials require a supported OS credential vault")
-    }
-}
-
-pub fn development_credential_exists() -> Result<bool> {
-    #[cfg(windows)]
-    { Ok(vault::read_optional(DEVELOPMENT_REFERENCE.strip_prefix("windows:").unwrap())?.is_some()) }
-    #[cfg(not(windows))]
-    { Ok(false) }
-}
-
 pub fn resolve(reference: &str) -> Result<String> {
     let secret = if let Some(name) = reference.strip_prefix("env:") {
         validate_env(name)?;
@@ -63,8 +33,10 @@ pub fn validate_env(name: &str) -> Result<()> {
 mod vault {
     use super::*;
     use windows_sys::Win32::Security::Credentials::{
-        CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC, CREDENTIALW, CredFree, CredReadW, CredWriteW,
+        CRED_TYPE_GENERIC, CredFree, CredReadW,
     };
+    #[cfg(test)]
+    use windows_sys::Win32::Security::Credentials::{CRED_PERSIST_LOCAL_MACHINE, CREDENTIALW, CredWriteW};
     fn target(s: &str) -> Result<Vec<u16>> {
         ensure!(
             s.starts_with("Amity/Echo/Cadenza/") && s.len() <= 200 && !s.contains('\0'),
@@ -105,6 +77,7 @@ mod vault {
             result.map(Some)
         }
     }
+    #[cfg(test)]
     pub fn write(name: &str, secret: &str) -> Result<()> {
         let mut name = target(name)?;
         let mut c: CREDENTIALW = unsafe { std::mem::zeroed() };
@@ -162,9 +135,6 @@ mod tests {
 mod vault {
     use super::*;
     pub fn read(_: &str) -> Result<String> {
-        bail!("Windows credential storage is unavailable; use an env: credential reference")
-    }
-    pub fn write(_: &str, _: &str) -> Result<()> {
         bail!("Windows credential storage is unavailable; use an env: credential reference")
     }
 }

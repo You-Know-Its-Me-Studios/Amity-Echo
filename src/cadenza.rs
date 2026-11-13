@@ -148,11 +148,18 @@ pub struct Client {
 }
 impl Client {
     pub fn connect(settings: &CadenzaSettings) -> Result<Self> {
-        crate::development::prepare(settings)?;
+        // Check service availability before reading a credential so an offline
+        // server is never misreported as an authentication setup problem.
+        let (stream, timeout) = Self::open_stream(settings)?;
         let secret = crate::credentials::resolve(&settings.credential_ref)?;
-        Self::connect_authenticated(settings, secret)
+        Self::negotiate(settings, secret, stream, timeout)
     }
+    #[cfg(test)]
     fn connect_authenticated(settings: &CadenzaSettings, secret: String) -> Result<Self> {
+        let (stream, timeout) = Self::open_stream(settings)?;
+        Self::negotiate(settings, secret, stream, timeout)
+    }
+    fn open_stream(settings: &CadenzaSettings) -> Result<(TcpStream, Duration)> {
         let uri = endpoint(settings)?;
         let timeout = Duration::from_secs(settings.connect_timeout_seconds);
         let host = uri.host().unwrap().trim_matches(['[', ']']);
@@ -179,10 +186,13 @@ impl Client {
                 break;
             }
         }
-        let stream=connection.context("Cadenza is unavailable; start the configured service or update the endpoint in /settings")?;
+        let stream=connection.context("Cadenza unavailable; start the server or check its URL in /settings")?;
         stream.set_read_timeout(Some(timeout))?;
         stream.set_write_timeout(Some(timeout))?;
         stream.set_nodelay(true)?;
+        Ok((stream, timeout))
+    }
+    fn negotiate(settings: &CadenzaSettings, secret: String, stream: TcpStream, timeout: Duration) -> Result<Self> {
         let config = WebSocketConfig::default()
             .max_message_size(Some(MAX_PAYLOAD))
             .max_frame_size(Some(MAX_PAYLOAD))
@@ -541,6 +551,22 @@ mod tests {
                 "{url}"
             );
         }
+    }
+    #[test]
+    #[cfg(windows)]
+    fn offline_server_is_not_reported_as_missing_credentials() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let settings = CadenzaSettings {
+            endpoint: format!("ws://127.0.0.1:{port}/cadenza"),
+            credential_ref: format!("windows:Amity/Echo/Cadenza/missing-{}", std::process::id()),
+            ..Default::default()
+        };
+        let missing = Client::connect(&settings).err().unwrap().to_string();
+        assert!(missing.contains("credential is missing"), "{missing}");
+        drop(listener);
+        let offline = Client::connect(&settings).err().unwrap().to_string();
+        assert!(offline.contains("Cadenza unavailable"), "{offline}");
     }
     #[test]
     fn dynamic_discovery_and_health() {

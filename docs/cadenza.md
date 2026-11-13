@@ -15,10 +15,8 @@ Connection settings live in the existing global `%LOCALAPPDATA%\Amity\Echo\confi
 ```json
 {
   "endpoint": "ws://127.0.0.1:7941/cadenza",
-  "credential_ref": "windows:Amity/Echo/Cadenza/development",
+  "credential_ref": "env:CADENZA_API_TOKEN",
   "default_model": null,
-  "development_executable": null,
-  "development_config": null,
   "connect_timeout_seconds": 5,
   "request_timeout_seconds": 120,
   "max_tokens": 32
@@ -27,7 +25,7 @@ Connection settings live in the existing global `%LOCALAPPDATA%\Amity\Echo\confi
 
 `default_model`, when selected, records the actual discovered identity, cryptographic root and discovery metadata. It is not a display-name routing alias. Project registrations no longer carry model profiles or selected-provider settings. On migration, the original config bytes are saved once as `config.pre-cadenza.json`; the previously selected governance binding is preserved as the project's base host config, then retired inference fields disappear from active configuration. Existing host files and session messages are not deleted.
 
-The development credential is generated automatically and stored in Windows Credential Manager. `/settings` → **Local development inference** selects the installed Cadenza executable and development configuration, not a credential. `AMITY_CADENZA_HOME` can supply the installation directory instead. Echo starts a missing configured service with the same secret as its client, passing the secret through the child environment rather than arguments, files, URLs, prompts, or logs. Existing listeners are never replaced and existing vault credentials are never rotated automatically. Explicit environment credential references remain supported for existing internal configurations but are not the customer setup flow. Python/Rust process memory zeroization is not promised.
+Echo never locates or starts Cadenza. `/settings` → **Cadenza connection** configures the global WebSocket URL and credential reference. `env:NAME` reads an existing environment variable; `windows:Amity/Echo/Cadenza/name` reads an existing Windows Credential Manager credential. The service and Echo need the same credential, but Echo does not generate, display, or place it in JSON, prompts, URLs, or command arguments. Python/Rust process memory zeroization is not promised.
 
 Plaintext `ws://` is accepted only for literal loopback IP addresses. Remote endpoints require `wss://` with normal Rustls certificate verification and WebPKI roots; no insecure certificate override is provided. Userinfo, queries, fragments and paths other than `/cadenza` are rejected. The current Cadenza server itself only listens on loopback; a physical remote TLS deployment has not been accepted.
 
@@ -41,7 +39,7 @@ Token event text is the complete decoded generated text so far. Both the model A
 
 Generation IO runs on a worker while the terminal polls input every 25 ms. Ctrl+C sends cancellation and waits up to five seconds for completion; a timeout closes the connection, cancelling owned work. Natural completions validate the server's prompt/output usage against observed events. Current Cadenza cancellation completions omit usage, so cancellation/interruption accounting uses admitted prompt tokens and observed token events, without inventing additional server-side usage or prices. Partial generated text and queued user instructions are preserved on failure.
 
-Interactive startup checks the connection, readiness and selected identity. Picker/discovery IO also runs off the UI thread. Echo can start a configured local development service when its port is vacant; missing executable, configuration, package, or trust file produces a specific error. A missing service leaves the terminal usable and the selection unchanged. New turns use fresh authenticated connections; completed/partial streams are never automatically replayed. Service restart recovery is therefore for new requests, not silent continuation of an interrupted request.
+Interactive startup checks the configured server, readiness and selected identity. Picker/discovery IO also runs off the UI thread. A missing service reports `Cadenza unavailable` and leaves the terminal usable; missing or rejected credentials are reported separately. New turns use fresh authenticated connections; completed/partial streams are never automatically replayed. Service restart recovery is therefore for new requests, not silent continuation of an interrupted request.
 
 ## Model picker and sessions
 

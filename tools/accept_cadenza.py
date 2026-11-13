@@ -49,6 +49,7 @@ def main():
     sys.path.insert(0,str(cadenza/'tools'));from client import Client
     configuration=json.loads(Path(a.cadenza_config).read_text(encoding='utf-8'));token=secrets.token_hex(32)
     env=dict(os.environ);env['CADENZA_API_TOKEN']=token;env['AMITY_ECHO_HOME']=str(home);env['ECHO_CADENZA_REPORT']=str(output/'protocol.json');env['PYTHONDONTWRITEBYTECODE']='1'
+    env.pop('AMITY_CADENZA_HOME',None)
     env[configuration['api_token_env']]=token
     env['ECHO_AMITY_REPORT']=str(output/'amity.json')
     cuda=Path(env['CUDA_PATH']);env['PATH']=str(cuda/'bin')+os.pathsep+env['PATH']
@@ -111,9 +112,12 @@ def main():
         for session_path in (home/'sessions').glob('*.json'):
             session=json.loads(session_path.read_text(encoding='utf-8'));assert session['cadenza_model']['root']==models[0]['root']
         terminal=Terminal(executable,other,env);terminal.wait('Cadenza ready');terminal.type('/model\r');screen=terminal.wait('[current]');(output/'restart-picker.txt').write_text(screen,encoding='utf-8');terminal.type('\x1b');time.sleep(.2);terminal.stop();terminal=None
+        desktop=Path.home()/'Desktop'
+        no_credential_env=dict(env);no_credential_env.pop(configuration['api_token_env'],None)
+        terminal=Terminal(executable,desktop,no_credential_env);terminal.wait('Cadenza credential unavailable');terminal.stop();terminal=None
         # Unavailable service: UI stays usable, picker errors, selection is unchanged.
         service.terminate();service.wait(timeout=15)
-        terminal=Terminal(executable,other,env);terminal.wait('Inference unavailable');terminal.type('/model\r');screen=terminal.wait('Cadenza is unavailable');(output/'offline-picker.txt').write_text(screen,encoding='utf-8')
+        terminal=Terminal(executable,desktop,no_credential_env);terminal.wait('Cadenza unavailable');terminal.type('/model\r');screen=terminal.wait('Cadenza unavailable');(output/'offline-picker.txt').write_text(screen,encoding='utf-8')
         assert json.loads((home/'config.json').read_text(encoding='utf-8'))['cadenza']['default_model']['root']==models[0]['root']
         terminal.stop();terminal=None
         service=subprocess.Popen([str(cadenza/'target/release/cadenza.exe'),'serve','--config',str(Path(a.cadenza_config).resolve())],cwd=output,env=env,stdout=service_log,stderr=subprocess.STDOUT)
@@ -137,7 +141,7 @@ def main():
         cancelled=[json.loads(p.read_text(encoding='utf-8')) for p in (home/'sessions').glob('*.json') if 'cancel-workspace' in json.loads(p.read_text(encoding='utf-8')).get('working_directory','')]
         assert len(cancelled)==1 and cancelled[0]['status']=='interrupted' and cancelled[0]['usage_output_tokens']>0
         amity=json.loads((output/'amity.json').read_text(encoding='utf-8'))
-        report={'discovery':True,'interactive_picker':True,'enter_selection':True,'escape_preserves_selection':True,'global_selection_persists':True,'cross_directory_generation':True,'actual_engine_output':True,'restart_picker_highlights_current':True,'legacy_config_backup':True,'amity_reads_and_permission_rules':True,'native_host_callback':True,'offline_picker_preserves_selection':True,'service_restart_recovery':True,'interactive_ctrl_c_cancellation':True,'amity_task_creation_passed':amity['task_creation_passed'],'amity_task_creation_error':amity['task_creation_error'],'model_root':models[0]['root'],'model_identity':models[0]['identity'],'echo_executable':str(executable)}
+        report={'discovery':True,'interactive_picker':True,'enter_selection':True,'escape_preserves_selection':True,'global_selection_persists':True,'cross_directory_generation':True,'actual_engine_output':True,'restart_picker_highlights_current':True,'legacy_config_backup':True,'amity_reads_and_permission_rules':True,'native_host_callback':True,'desktop_missing_credential_reported':True,'desktop_offline_without_credential_reported':True,'offline_picker_preserves_selection':True,'service_restart_recovery':True,'interactive_ctrl_c_cancellation':True,'amity_task_creation_passed':amity['task_creation_passed'],'amity_task_creation_error':amity['task_creation_error'],'model_root':models[0]['root'],'model_identity':models[0]['identity'],'echo_executable':str(executable)}
         (output/'result.json').write_text(json.dumps(report,indent=2),encoding='utf-8');print(json.dumps(report,indent=2))
     finally:
         if terminal:terminal.stop()
